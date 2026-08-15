@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
+import { WorktreeTimeoutError } from "./errors.js";
 import {
   create,
   generateTempBranchName,
@@ -161,6 +162,18 @@ describe("generateTempBranchName", () => {
 });
 
 describe("WorktreeManager.create", () => {
+  it("uses the caller-provided worktree timeout", async () => {
+    const repoDir = await setupRepo();
+    const error = await runFail(create(repoDir, { timeoutMs: 0 }));
+
+    expect(error).toBeInstanceOf(WorktreeTimeoutError);
+    expect(error).toMatchObject({
+      _tag: "WorktreeTimeoutError",
+      timeoutMs: 0,
+      operation: "create",
+    });
+  });
+
   it("creates a worktree at .sandcastle/worktrees/<name>/", async () => {
     const repoDir = await setupRepo();
     const { path } = await run(create(repoDir));

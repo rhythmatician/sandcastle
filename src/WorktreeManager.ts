@@ -5,7 +5,7 @@ import { randomBytes } from "node:crypto";
 import { join, normalize } from "node:path";
 import { WorktreeError, WorktreeTimeoutError, withTimeout } from "./errors.js";
 
-const WORKTREE_TIMEOUT_MS = 30_000;
+const WORKTREE_TIMEOUT_MS = 120_000;
 
 /**
  * Git global flags that prevent `git worktree add -b` from writing upstream
@@ -50,7 +50,7 @@ const execGit = (
     // callers match git's stderr (e.g. "invalid reference") to decide control
     // flow; under a localized locale gettext translates those strings and the
     // matches silently fail, breaking worktree creation (issue #595).
-    execFile(
+    const child = execFile(
       "git",
       args,
       { cwd, env: { ...process.env, LC_ALL: "C" } },
@@ -68,6 +68,7 @@ const execGit = (
         }
       },
     );
+    return Effect.sync(() => child.kill());
   });
 
 /**
@@ -294,13 +295,16 @@ export const create = (
     branch?: string;
     baseBranch?: string;
     name?: string;
+    timeoutMs?: number;
   },
 ): Effect.Effect<
   WorktreeInfo,
   WorktreeError | WorktreeTimeoutError,
   FileSystem.FileSystem
-> =>
-  Effect.gen(function* () {
+> => {
+  const timeoutMs = opts?.timeoutMs ?? WORKTREE_TIMEOUT_MS;
+
+  return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
     yield* fs
@@ -416,16 +420,17 @@ export const create = (
     return { path: worktreePath, branch };
   }).pipe(
     withTimeout(
-      WORKTREE_TIMEOUT_MS,
+      timeoutMs,
       () =>
         new WorktreeTimeoutError({
-          message: `Worktree creation timed out after ${WORKTREE_TIMEOUT_MS}ms`,
-          timeoutMs: WORKTREE_TIMEOUT_MS,
+          message: `Worktree creation timed out after ${timeoutMs}ms`,
+          timeoutMs,
           path: repoDir,
           operation: "create",
         }),
     ),
   );
+};
 
 /**
  * Returns true if the worktree at `worktreePath` has any uncommitted changes:
@@ -460,6 +465,7 @@ export const remove = (
  */
 export const pruneStale = (
   repoDir: string,
+  timeoutMs: number = WORKTREE_TIMEOUT_MS,
 ): Effect.Effect<
   void,
   WorktreeError | WorktreeTimeoutError,
@@ -526,11 +532,11 @@ export const pruneStale = (
     }
   }).pipe(
     withTimeout(
-      WORKTREE_TIMEOUT_MS,
+      timeoutMs,
       () =>
         new WorktreeTimeoutError({
-          message: `Worktree prune timed out after ${WORKTREE_TIMEOUT_MS}ms`,
-          timeoutMs: WORKTREE_TIMEOUT_MS,
+          message: `Worktree prune timed out after ${timeoutMs}ms`,
+          timeoutMs,
           path: repoDir,
           operation: "prune",
         }),
