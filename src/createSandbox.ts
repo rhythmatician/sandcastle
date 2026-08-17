@@ -28,8 +28,16 @@ import {
   buildCompletionMessage,
   buildContextWindowLines,
   buildLogFilename,
+  buildStructuredOutputRetryFeedback,
   printFileDisplayStartup,
 } from "./run.js";
+import {
+  StructuredOutputError,
+  type OutputDefinition,
+  type OutputObjectDefinition,
+  type OutputStringDefinition,
+} from "./Output.js";
+import { extractStructuredOutput } from "./extractStructuredOutput.js";
 import {
   withSandboxLifecycle,
   runHostHooks,
@@ -120,6 +128,8 @@ export interface ResumeSandboxRunResultOptions {
   readonly name?: string;
   /** Logging mode. */
   readonly logging?: LoggingOption;
+  /** Structured output definition, extracted from the agent's stdout. */
+  readonly output?: OutputDefinition;
   /**
    * An `AbortSignal` that cancels the run when aborted.
    *
@@ -162,6 +172,8 @@ export interface SandboxRunResult {
   readonly completionSignal?: string;
   /** Combined stdout output from all agent iterations. */
   readonly stdout: string;
+  /** Schema-validated or string structured output, when requested. */
+  readonly output?: unknown;
   /** List of commits made by the agent during the run. */
   readonly commits: { sha: string }[];
   /** Path to the log file, if logging was drained to a file. */
@@ -227,6 +239,12 @@ export interface Sandbox {
   /** Host path to the worktree. */
   readonly worktreePath: string;
   /** Invoke an agent inside the existing sandbox. */
+  run<T>(
+    options: SandboxRunOptions & { output: OutputObjectDefinition<T> },
+  ): Promise<SandboxRunResult & { output: T }>;
+  run(
+    options: SandboxRunOptions & { output: OutputStringDefinition },
+  ): Promise<SandboxRunResult & { output: string }>;
   run(options: SandboxRunOptions): Promise<SandboxRunResult>;
   /** Launch an interactive agent session inside the existing sandbox. */
   interactive(
@@ -327,7 +345,7 @@ const buildSandboxHandle = (
     branch,
     worktreePath: worktreePath,
 
-    run: async (runOptions: SandboxRunOptions): Promise<SandboxRunResult> => {
+    run: (async (runOptions: SandboxRunOptions): Promise<SandboxRunResult> => {
       // If signal is already aborted, reject immediately without any setup
       runOptions.signal?.throwIfAborted();
 
@@ -351,6 +369,28 @@ const buildSandboxHandle = (
         throw new Error(
           "forkSession requires resumeSession. " +
             "Use sandboxRunResult.fork(prompt) to fork the most recent captured session.",
+        );
+      }
+
+      if (runOptions.output && maxIterations !== 1) {
+        throw new Error(
+          "output requires maxIterations to be 1. " +
+            "Structured output is only supported for single-iteration runs.",
+        );
+      }
+
+      const outputMaxRetries = runOptions.output?.maxRetries ?? 0;
+      if (outputMaxRetries < 0 || !Number.isInteger(outputMaxRetries)) {
+        throw new Error(
+          "output.maxRetries must be a non-negative integer. " +
+            `Received: ${outputMaxRetries}`,
+        );
+      }
+      if (outputMaxRetries > 0 && !provider.sessionStorage) {
+        throw new Error(
+          `output.maxRetries requires an agent provider that supports session resumption. ` +
+            `The "${provider.name}" provider does not. ` +
+            "Use claudeCode, codex, or pi, or set maxRetries to 0.",
         );
       }
 
@@ -400,6 +440,16 @@ const buildSandboxHandle = (
           );
         }).pipe(Effect.provide(silentDisplayLayer)),
       );
+
+      if (runOptions.output) {
+        const openTag = `<${runOptions.output.tag}>`;
+        if (!resolvedPrompt.includes(openTag)) {
+          throw new Error(
+            `output tag <${runOptions.output.tag}> not found in the resolved prompt. ` +
+              "The caller must instruct the agent to emit the configured tag.",
+          );
+        }
+      }
 
       const resolvedLogging: LoggingOption = runOptions.logging ?? {
         type: "file",
@@ -514,40 +564,80 @@ const buildSandboxHandle = (
       // The functions re-enter the same long-lived sandbox by calling
       // sandboxHandle.run() — container and worktree stay warm.
       const lastIteration = result.iterations.at(-1);
-      if (provider.sessionStorage && lastIteration?.sessionId) {
-        const capturedSessionId = lastIteration.sessionId;
-        return {
-          ...baseResult,
-          resume: (
-            nextPrompt: string,
-            resumeOptions?: ResumeSandboxRunResultOptions,
-          ): Promise<SandboxRunResult> =>
-            sandboxHandle.run({
+      const resultWithSessionMethods: SandboxRunResult =
+        provider.sessionStorage && lastIteration?.sessionId
+          ? {
+              ...baseResult,
+              resume: (
+                nextPrompt: string,
+                resumeOptions?: ResumeSandboxRunResultOptions,
+              ): Promise<SandboxRunResult> =>
+                sandboxHandle.run({
+                  ...runOptions,
+                  ...resumeOptions,
+                  prompt: nextPrompt,
+                  promptFile: undefined,
+                  maxIterations: 1,
+                  resumeSession: lastIteration.sessionId,
+                }),
+              fork: (
+                nextPrompt: string,
+                forkOptions?: ResumeSandboxRunResultOptions,
+              ): Promise<SandboxRunResult> =>
+                sandboxHandle.run({
+                  ...runOptions,
+                  ...forkOptions,
+                  prompt: nextPrompt,
+                  promptFile: undefined,
+                  maxIterations: 1,
+                  resumeSession: lastIteration.sessionId,
+                  forkSession: true,
+                }),
+            }
+          : baseResult;
+
+      if (runOptions.output) {
+        try {
+          const output = await extractStructuredOutput(
+            resultWithSessionMethods.stdout,
+            runOptions.output,
+            {
+              commits: resultWithSessionMethods.commits,
+              branch: result.branch,
+              preservedWorktreePath: result.preservedWorktreePath,
+              sessionId: lastIteration?.sessionId,
+              sessionFilePath: lastIteration?.sessionFilePath,
+            },
+          );
+          return { ...resultWithSessionMethods, output };
+        } catch (error) {
+          if (
+            error instanceof StructuredOutputError &&
+            outputMaxRetries > 0 &&
+            error.sessionId !== undefined
+          ) {
+            return sandboxHandle.run({
               ...runOptions,
-              ...resumeOptions,
-              prompt: nextPrompt,
+              prompt: buildStructuredOutputRetryFeedback(
+                error,
+                outputMaxRetries - 1,
+              ),
               promptFile: undefined,
-              maxIterations: 1,
-              resumeSession: capturedSessionId,
-            }),
-          fork: (
-            nextPrompt: string,
-            forkOptions?: ResumeSandboxRunResultOptions,
-          ): Promise<SandboxRunResult> =>
-            sandboxHandle.run({
-              ...runOptions,
-              ...forkOptions,
-              prompt: nextPrompt,
-              promptFile: undefined,
-              maxIterations: 1,
-              resumeSession: capturedSessionId,
-              forkSession: true,
-            }),
-        };
+              promptArgs: undefined,
+              resumeSession: error.sessionId,
+              forkSession: false,
+              output: {
+                ...runOptions.output,
+                maxRetries: outputMaxRetries - 1,
+              },
+            });
+          }
+          throw error;
+        }
       }
 
-      return baseResult;
-    },
+      return resultWithSessionMethods;
+    }) as Sandbox["run"],
 
     interactive: async (
       interactiveOptions: SandboxInteractiveOptions,

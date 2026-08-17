@@ -24,6 +24,7 @@ import {
 import { encodeProjectPath } from "./SessionStore.js";
 import { testIsolated } from "./sandboxes/test-isolated.js";
 import { makeLocalSandbox } from "./testSandbox.js";
+import { Output } from "./Output.js";
 
 /** Dummy sandbox provider used to satisfy the required `sandbox` field in test mode. */
 const testSandbox = createBindMountSandboxProvider({
@@ -295,6 +296,81 @@ describe("createSandbox", () => {
       expect(result.iterations.length).toBe(1);
       expect(typeof result.stdout).toBe("string");
       expect(Array.isArray(result.commits)).toBe(true);
+    } finally {
+      await sandbox.close();
+      await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sandbox.run() returns the last matching Output.object payload", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "sandbox-output-object-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "init.txt", "init", "initial commit");
+
+    const sandbox = await createSandbox({
+      branch: "output-object-branch",
+      sandbox: testSandbox,
+      cwd: hostDir,
+      _test: {
+        buildSandbox: (sandboxDir) =>
+          makeMockAgentLayer(
+            sandboxDir,
+            async () =>
+              '<result>{"verdict":"approve"}</result>\n' +
+              '<result>{"verdict":"reject"}</result>',
+          ),
+      },
+    });
+
+    try {
+      const result = await sandbox.run({
+        agent: testProvider,
+        prompt: "emit the verdict in <result> tags",
+        output: Output.object({
+          tag: "result",
+          schema: {
+            "~standard": {
+              version: 1 as const,
+              vendor: "test",
+              validate: (value: unknown) => ({ value }),
+            },
+          },
+        }),
+      });
+
+      expect(result.output).toEqual({ verdict: "reject" });
+    } finally {
+      await sandbox.close();
+      await rm(hostDir, { recursive: true, force: true });
+    }
+  });
+
+  it("sandbox.run() returns Output.string content", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "sandbox-output-string-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "init.txt", "init", "initial commit");
+
+    const sandbox = await createSandbox({
+      branch: "output-string-branch",
+      sandbox: testSandbox,
+      cwd: hostDir,
+      _test: {
+        buildSandbox: (sandboxDir) =>
+          makeMockAgentLayer(
+            sandboxDir,
+            async () => "<summary>  accepted  </summary>",
+          ),
+      },
+    });
+
+    try {
+      const result = await sandbox.run({
+        agent: testProvider,
+        prompt: "emit the summary in <summary> tags",
+        output: Output.string({ tag: "summary" }),
+      });
+
+      expect(result.output).toBe("accepted");
     } finally {
       await sandbox.close();
       await rm(hostDir, { recursive: true, force: true });

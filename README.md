@@ -283,6 +283,11 @@ const result = await sandbox.run({
 console.log(result.commits); // [{ sha: "abc123" }]
 ```
 
+`sandbox.run()` also supports `Output.object({ tag, schema })` and
+`Output.string({ tag })`; the validated or trimmed value is returned as
+`result.output`. Structured output uses the last matching tag and requires
+`maxIterations === 1`.
+
 #### Multi-run implement-then-review
 
 ```typescript
