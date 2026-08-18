@@ -1542,7 +1542,6 @@ export const muse = (
       dangerouslySkipPermissions,
       resumeSession,
     }: AgentCommandOptions): PrintCommand {
-      assertMusePrintPromptFitsArgv(prompt);
       const effortFlag = options?.reasoningEffort
         ? ` --reasoning-effort ${options.reasoningEffort}`
         : "";
@@ -1553,6 +1552,34 @@ export const muse = (
       const sessionFlag = resumeSession
         ? ` --session-id ${shellEscape(resumeSession)}`
         : "";
+      // Use --prompt-file for large prompts to avoid Linux ARG_MAX (128 KiB) argv limit.
+      // Small prompts still use argv for backwards compat; large ones are delivered via
+      // stdin piped to base64 -d to avoid argv overflow, then passed via --prompt-file.
+      const promptBytes = Buffer.byteLength(prompt, "utf8");
+      if (promptBytes > MUSE_PRINT_PROMPT_MAX_BYTES) {
+        const b64 = Buffer.from(prompt, "utf8").toString("base64");
+        const tmpFile =
+          "/tmp/muse-prompt-" +
+          Date.now() +
+          "-" +
+          Math.random().toString(36).slice(2) +
+          ".md";
+        const writeCmd = "base64 -d > " + shellEscape(tmpFile);
+        const execCmd =
+          "muse exec --json --prompt-file " +
+          shellEscape(tmpFile) +
+          " --model " +
+          shellEscape(model) +
+          effortFlag +
+          baseUrlFlag +
+          yoloFlag +
+          sessionFlag;
+        return {
+          command:
+            writeCmd + " && " + execCmd + "; rm -f " + shellEscape(tmpFile),
+          stdin: b64,
+        };
+      }
       return {
         command: `muse exec --json --model ${shellEscape(model)}${effortFlag}${baseUrlFlag}${yoloFlag}${sessionFlag} ${shellEscape(prompt)}`,
       };
