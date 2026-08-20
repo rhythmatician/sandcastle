@@ -206,7 +206,11 @@ const invokeAgent = (
         );
       }
 
-      return { result: resultText || execResult.stdout, sessionId, usage };
+      return {
+        result: resultText || accumulatedOutput || execResult.stdout,
+        sessionId,
+        usage,
+      };
     }).pipe(
       Effect.ensuring(
         Effect.sync(() => {
