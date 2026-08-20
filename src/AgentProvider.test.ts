@@ -1039,7 +1039,9 @@ describe("muse factory", () => {
   it("buildPrintCommand transports the complete prompt outside argv", () => {
     const provider = muse("muse-spark-1.2");
     const { command, stdin } = provider.buildPrintCommand(opts("it's a test"));
-    expect(command).toContain("--prompt-file /dev/stdin");
+    expect(command).toContain("prompt_file=$(mktemp)");
+    expect(command).toContain('cat > "$prompt_file"');
+    expect(command).toContain('--prompt-file "$prompt_file"');
     expect(command).not.toContain("it's a test");
     expect(stdin).toBe("it's a test");
   });

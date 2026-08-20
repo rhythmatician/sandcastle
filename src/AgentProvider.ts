@@ -1546,7 +1546,7 @@ export const muse = (
         ? ` --session-id ${shellEscape(resumeSession)}`
         : "";
       return {
-        command: `muse exec --json --model ${shellEscape(model)}${effortFlag}${baseUrlFlag}${yoloFlag}${sessionFlag} --prompt-file /dev/stdin`,
+        command: `prompt_file=$(mktemp) && trap 'rm -f "$prompt_file"' EXIT && cat > "$prompt_file" && muse exec --json --model ${shellEscape(model)}${effortFlag}${baseUrlFlag}${yoloFlag}${sessionFlag} --prompt-file "$prompt_file"`,
         stdin: prompt,
       };
     },
