@@ -1036,19 +1036,21 @@ describe("muse factory", () => {
     expect(command).toContain("--json");
   });
 
-  it("buildPrintCommand passes prompt as a positional shell-escaped argument", () => {
+  it("buildPrintCommand transports the complete prompt outside argv", () => {
     const provider = muse("muse-spark-1.2");
     const { command, stdin } = provider.buildPrintCommand(opts("it's a test"));
-    expect(command.endsWith("'it'\\''s a test'")).toBe(true);
-    expect(stdin).toBeUndefined();
+    expect(command).toContain("--prompt-file /dev/stdin");
+    expect(command).not.toContain("it's a test");
+    expect(stdin).toBe("it's a test");
   });
 
-  it("buildPrintCommand rejects prompts larger than the argv-safe limit", () => {
+  it("buildPrintCommand keeps the real #151-sized reviewer prompt below the Windows argv limit", () => {
     const provider = muse("muse-spark-1.2");
-    const huge = "x".repeat(120 * 1024 + 1);
-    expect(() => provider.buildPrintCommand(opts(huge))).toThrow(
-      /Muse print-mode prompt/,
-    );
+    const prompt = "x".repeat(34_722);
+    const { command, stdin } = provider.buildPrintCommand(opts(prompt));
+    expect(Buffer.byteLength(command, "utf8")).toBeLessThan(32_767);
+    expect(command).not.toContain(prompt);
+    expect(stdin).toBe(prompt);
   });
 
   it("buildPrintCommand includes reasoning effort when specified", () => {

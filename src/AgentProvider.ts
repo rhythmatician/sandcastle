@@ -154,13 +154,15 @@ const parseCursorToolCallStarted = (
   const tc = toolCall as Record<string, unknown>;
 
   const readToolCall = tc.readToolCall as
-    { args?: { path?: unknown } } | undefined;
+    | { args?: { path?: unknown } }
+    | undefined;
   if (readToolCall?.args && typeof readToolCall.args.path === "string") {
     return [{ type: "tool_call", name: "Read", args: readToolCall.args.path }];
   }
 
   const writeToolCall = tc.writeToolCall as
-    { args?: { path?: unknown } } | undefined;
+    | { args?: { path?: unknown } }
+    | undefined;
   if (writeToolCall?.args && typeof writeToolCall.args.path === "string") {
     return [
       { type: "tool_call", name: "Write", args: writeToolCall.args.path },
@@ -920,7 +922,8 @@ const parseOpenCodeStreamLine = (line: string): ParsedStreamEvent[] => {
     if (obj.type === "tool_use" && part?.type === "tool") {
       if (typeof part.tool !== "string") return [];
       const state = part.state as
-        { status?: string; input?: Record<string, unknown> } | undefined;
+        | { status?: string; input?: Record<string, unknown> }
+        | undefined;
       if (state?.status !== "completed") return [];
       const input = state.input;
       if (!input) return [];
@@ -1157,22 +1160,6 @@ export const copilot = (
 // ---------------------------------------------------------------------------
 
 /**
- * Muse `exec --json` passes the prompt as a positional argument or via
- * `--prompt-file`. Linux caps argv at ~128 KiB (ARG_MAX), so guard the
- * positional form the same way Cursor/Copilot do.
- */
-const MUSE_PRINT_PROMPT_MAX_BYTES = 120 * 1024;
-
-function assertMusePrintPromptFitsArgv(prompt: string): void {
-  const n = Buffer.byteLength(prompt, "utf8");
-  if (n > MUSE_PRINT_PROMPT_MAX_BYTES) {
-    throw new Error(
-      `Muse print-mode prompt is ${n} bytes (max ${MUSE_PRINT_PROMPT_MAX_BYTES} bytes). Muse exec accepts the prompt as a command-line argument; shorten the prompt or split the work. Sandcastle writes large prompts via --prompt-file where supported.`,
-    );
-  }
-}
-
-/**
  * Parse one line of `muse exec` JSONL output.
  *
  * Verified against the binary's AgentRunEvent variants (TextDelta,
@@ -1342,7 +1329,13 @@ const parseMuseStreamLine = (
 
 /** Muse's reasoning-effort flag values. Mirrors `muse exec --help`. */
 export type MuseReasoningEffort =
-  "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra";
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "ultra";
 
 export interface MuseOptions {
   /** Reasoning effort level. Maps to the CLI's --reasoning-effort flag. */
@@ -1542,7 +1535,6 @@ export const muse = (
       dangerouslySkipPermissions,
       resumeSession,
     }: AgentCommandOptions): PrintCommand {
-      assertMusePrintPromptFitsArgv(prompt);
       const effortFlag = options?.reasoningEffort
         ? ` --reasoning-effort ${options.reasoningEffort}`
         : "";
@@ -1554,7 +1546,8 @@ export const muse = (
         ? ` --session-id ${shellEscape(resumeSession)}`
         : "";
       return {
-        command: `muse exec --json --model ${shellEscape(model)}${effortFlag}${baseUrlFlag}${yoloFlag}${sessionFlag} ${shellEscape(prompt)}`,
+        command: `muse exec --json --model ${shellEscape(model)}${effortFlag}${baseUrlFlag}${yoloFlag}${sessionFlag} --prompt-file /dev/stdin`,
+        stdin: prompt,
       };
     },
 
