@@ -21,6 +21,7 @@ import { substitutePromptArgs } from "./PromptArgumentSubstitution.js";
 import {
   claudeCode,
   codex as codexFactory,
+  muse,
   opencode as opencodeFactory,
   pi as piFactory,
   DEFAULT_MODEL,
@@ -1464,6 +1465,61 @@ describe("Orchestrator error handling", () => {
     expect(result.iterations.length).toBe(1);
     expect(result.completionSignal).toBe("<promise>COMPLETE</promise>");
   });
+
+  it("returns reconstructed Muse assistant text when the stream has no terminal result event", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "orch-muse-result-"));
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    const provider = muse("muse-spark-1.2");
+    const assistantText =
+      '<verdict>{"approved":true,"findings":[],"acceptanceCriteriaMet":[{"criterion":"#151 contract","met":true,"evidence":"focused suites green"}],"summary":"Functional contract fully met."}</verdict>\n<promise>COMPLETE</promise>';
+    const rawLines = [
+      JSON.stringify({
+        schema_version: 1,
+        id: "sanitized-151-review-event-1",
+        payload_type: "run.output.delta",
+        payload: { kind: "run_output_delta", text: assistantText.slice(0, 80) },
+      }),
+      JSON.stringify({
+        schema_version: 1,
+        id: "sanitized-151-review-event-2",
+        payload_type: "run.output.delta",
+        payload: { kind: "run_output_delta", text: assistantText.slice(80) },
+      }),
+    ];
+
+    const { factoryLayer } = makeTestSandboxFactory(hostDir, (dir) => {
+      const real = makeLocalSandbox(dir);
+      return {
+        exec: (command, options) => {
+          if (command.includes("muse exec") && options?.onLine) {
+            for (const line of rawLines) options.onLine(line);
+            return Effect.succeed({
+              stdout: rawLines.join("\n"),
+              stderr: "",
+              exitCode: 0,
+            });
+          }
+          return real.exec(command, options);
+        },
+        copyIn: (hostPath, sandboxPath) => real.copyIn(hostPath, sandboxPath),
+        copyFileOut: (sandboxPath, hostPath) =>
+          real.copyFileOut(sandboxPath, hostPath),
+      };
+    });
+
+    const result = await Effect.runPromise(
+      orchestrate({
+        provider,
+        hostRepoDir: hostDir,
+        iterations: 1,
+        prompt: "review #151",
+      }).pipe(Effect.provide(Layer.merge(factoryLayer, testDisplayLayer))),
+    );
+
+    expect(result.stdout).toBe(assistantText);
+  }, 15_000);
 
   it("preserves iteration 1 work when agent fails on iteration 2", async () => {
     const hostDir = await mkdtemp(join(tmpdir(), "orch-partial-host-"));
