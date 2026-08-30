@@ -319,6 +319,8 @@ const buildVerboseRawLineSink = (
 
 /** Override default timeouts for built-in lifecycle steps. Unset keys keep their defaults. */
 export interface Timeouts {
+  /** Timeout (ms) for host-side worktree creation and stale-worktree pruning. Default: 120_000. */
+  readonly worktreeMs?: number;
   /** Timeout (ms) for the host-side copy of `copyToWorktree` paths into the worktree. Default: 60_000. */
   readonly copyToWorktreeMs?: number;
   /** Timeout (ms) for each in-sandbox git setup command (safe.directory, user.name/email, branch discovery). Default: 10_000. */

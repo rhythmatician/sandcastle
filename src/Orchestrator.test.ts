@@ -2618,14 +2618,15 @@ describe("Orchestrator Display integration", () => {
       (e) => e._tag === "status" && e.severity === "warn",
     );
 
-    // Should have at least 2 warning entries (at ~100ms and ~200ms)
+    // Should have at least 2 warning entries (at ~100ms and ~200ms) — wording is
+    // "Agent alive" not "Agent idle" (terminology fix: we cannot observe true
+    // idleness, only lack of observable output).
     expect(warningEntries.length).toBeGreaterThanOrEqual(2);
-    // First warning should say "1 minute" (even though the interval is 100ms in test)
     expect((warningEntries[0] as { message: string }).message).toContain(
-      "Agent idle for 1 minute",
+      "Agent alive for 1m",
     );
     expect((warningEntries[1] as { message: string }).message).toContain(
-      "Agent idle for 2 minutes",
+      "Agent alive for 2m",
     );
   }, 10_000);
 
@@ -2705,16 +2706,180 @@ describe("Orchestrator Display integration", () => {
       (e) => e._tag === "status" && e.severity === "warn",
     );
 
-    // Should have at least 2 warnings (one before text, one after text reset)
+    // Should have at least 2 warnings (one before text, one after text reset) —
+    // counter reset proves liveness: "Agent alive" not "Agent idle".
     expect(warningEntries.length).toBeGreaterThanOrEqual(2);
-    // Both should say "1 minute" because the counter was reset by the text event
     expect((warningEntries[0] as { message: string }).message).toContain(
-      "Agent idle for 1 minute",
+      "Agent alive for 1m",
     );
     expect((warningEntries[1] as { message: string }).message).toContain(
-      "Agent idle for 1 minute",
+      "Agent alive for 1m",
     );
   }, 10_000);
+
+  // ---------------------------------------------------------------------------
+  // Regression: #126 quiet worker — emergency timeout must not masquerade as
+  // liveness detection. A live agent that thinks quietly for > old 600s idle
+  // must not be killed; only the 30-min deadman should fire.
+  // This is an INTEGRATION test through the real Orchestrator worker boundary,
+  // not a constant comparison.
+  // ---------------------------------------------------------------------------
+  it("quiet worker that stays alive through old 600s boundary succeeds with 30-min emergency timeout", async () => {
+    const hostDir = await mkdtemp(join(tmpdir(), "orch-126-quiet-"));
+
+    await initRepo(hostDir);
+    await commitFile(hostDir, "hello.txt", "hello", "initial commit");
+
+    // Worker stays quiet for 350ms then emits text. With idleTimeoutSeconds=0.2
+    // (200ms) it WOULD be killed (old-budget behaviour). With 1s it survives.
+    // This proves the mechanism: worker alive through a quiet window that
+    // exceeds a short timeout must not be classified as failed when given the
+    // proper emergency timeout.
+    const { factoryLayer } = makeTestSandboxFactory(hostDir, (dir) => {
+      const real = makeLocalSandbox(dir);
+      return {
+        exec: (command, options) => {
+          if (command.startsWith("claude ") && options?.onLine) {
+            const onLine = options.onLine;
+            return Effect.gen(function* () {
+              // Quiet for 350ms — exceeds 200ms short timeout, within 1s long timeout
+              yield* Effect.promise(
+                () => new Promise((resolve) => setTimeout(resolve, 350)),
+              );
+              onLine(
+                JSON.stringify({
+                  type: "assistant",
+                  message: {
+                    content: [{ type: "text", text: "still thinking..." }],
+                  },
+                }),
+              );
+              yield* Effect.promise(
+                () => new Promise((resolve) => setTimeout(resolve, 50)),
+              );
+              onLine(
+                JSON.stringify({
+                  type: "result",
+                  result: "done <promise>COMPLETE</promise>",
+                }),
+              );
+              return { stdout: "done", stderr: "", exitCode: 0 };
+            });
+          }
+          return real.exec(command, options);
+        },
+        copyIn: (hostPath, sandboxPath) => real.copyIn(hostPath, sandboxPath),
+        copyFileOut: (sandboxPath, hostPath) =>
+          real.copyFileOut(sandboxPath, hostPath),
+      };
+    });
+
+    const displayEntries = Ref.unsafeMake<ReadonlyArray<DisplayEntry>>([]);
+    const displayLayer = SilentDisplay.layer(displayEntries);
+
+    // 1) Short timeout MUST fail — proves the quiet window is genuinely fatal
+    //    under the old 600s-equivalent budget (scaled to 200ms for test).
+    const shortExit = await Effect.runPromiseExit(
+      orchestrate({
+        provider: testProvider,
+        hostRepoDir: hostDir,
+        iterations: 1,
+        prompt: "test",
+        idleTimeoutSeconds: 0.2, // 200ms — shorter than the 350ms quiet period
+      }).pipe(
+        Effect.provide(
+          Layer.merge(
+            factoryLayer,
+            Layer.merge(displayLayer, noopAgentStreamEmitterLayer),
+          ),
+        ),
+      ),
+    );
+    expect(shortExit._tag).toBe("Failure");
+    if (shortExit._tag === "Failure") {
+      const err = Cause.squash(shortExit.cause);
+      expect(String(err)).toContain("No observable output for");
+      expect(String(err)).not.toContain("Agent idle");
+    }
+
+    // 2) Long timeout MUST succeed — same quiet period, but emergency timeout
+    //    is large enough (1s >> 350ms). Proves a live agent is NOT classified as
+    //    failed merely for being quiet when given the proper deadman budget.
+    // Use a FRESH hostDir — previous orchestrate leaves worktree/branch state
+    // that would make the second run fail for reasons unrelated to idle timeout.
+    const hostDir2 = await mkdtemp(join(tmpdir(), "orch-126-quiet-long-"));
+    await initRepo(hostDir2);
+    await commitFile(hostDir2, "hello.txt", "hello", "initial commit");
+    const displayEntries2 = Ref.unsafeMake<ReadonlyArray<DisplayEntry>>([]);
+    const { factoryLayer: factoryLayer2 } = makeTestSandboxFactory(
+      hostDir2,
+      (dir) => {
+        const real = makeLocalSandbox(dir);
+        return {
+          exec: (command, options) => {
+            if (command.startsWith("claude ") && options?.onLine) {
+              const onLine = options.onLine;
+              return Effect.gen(function* () {
+                yield* Effect.promise(
+                  () => new Promise((resolve) => setTimeout(resolve, 350)),
+                );
+                onLine(
+                  JSON.stringify({
+                    type: "assistant",
+                    message: {
+                      content: [{ type: "text", text: "still thinking..." }],
+                    },
+                  }),
+                );
+                yield* Effect.promise(
+                  () => new Promise((resolve) => setTimeout(resolve, 50)),
+                );
+                onLine(
+                  JSON.stringify({
+                    type: "result",
+                    result: "done <promise>COMPLETE</promise>",
+                  }),
+                );
+                return { stdout: "done", stderr: "", exitCode: 0 };
+              });
+            }
+            return real.exec(command, options);
+          },
+          copyIn: (hostPath, sandboxPath) => real.copyIn(hostPath, sandboxPath),
+          copyFileOut: (sandboxPath, hostPath) =>
+            real.copyFileOut(sandboxPath, hostPath),
+        };
+      },
+    );
+
+    const longExit = await Effect.runPromiseExit(
+      orchestrate({
+        provider: testProvider,
+        hostRepoDir: hostDir2,
+        iterations: 1,
+        prompt: "test",
+        idleTimeoutSeconds: 1, // 1000ms — larger than quiet period
+      }).pipe(
+        Effect.provide(
+          Layer.merge(
+            factoryLayer2,
+            Layer.merge(
+              SilentDisplay.layer(displayEntries2),
+              noopAgentStreamEmitterLayer,
+            ),
+          ),
+        ),
+      ),
+    );
+    if (longExit._tag === "Failure") {
+      const err = Cause.squash(longExit.cause);
+      console.error(
+        "longExit failed unexpectedly:",
+        String(err).slice(0, 2000),
+      );
+    }
+    expect(longExit._tag).toBe("Success");
+  }, 15_000);
 });
 
 // ---------------------------------------------------------------------------

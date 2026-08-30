@@ -102,14 +102,17 @@ const invokeAgent = (
           }),
         );
       } else {
-        // Pre-signal idle window — failure on expiry.
+        // Pre-signal idle window — emergency deadman. This is NOT liveness
+        // detection: a live agent thinking without emitting JSON is still alive.
+        // Only fire if no observable output for idleTimeoutMs. The timeout is
+        // intentionally large (30 min default) as an absolute backstop.
         timeoutFiber = Effect.runFork(
           Effect.gen(function* () {
             yield* Effect.sleep(Duration.millis(idleTimeoutMs));
             yield* Deferred.fail(
               timeoutSignal,
               new AgentIdleTimeoutError({
-                message: `Agent idle for ${idleTimeoutMs / 1000} seconds — no output received. Consider increasing the idle timeout with --idle-timeout.`,
+                message: `No observable output for ${idleTimeoutMs / 1000} seconds — agent process may still be alive (emergency timeout). Check verbose log for activity. Consider increasing --idle-timeout beyond ${idleTimeoutMs / 1000}s if the agent needs more quiet thinking time.`,
                 timeoutMs: idleTimeoutMs,
               }),
             );
@@ -248,7 +251,10 @@ const invokeAgent = (
   });
 
 const DEFAULT_COMPLETION_SIGNAL = "<promise>COMPLETE</promise>";
-const DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60; // 600 seconds
+// Emergency deadman only — not liveness detection. See invokeAgent comment above.
+// 30 minutes matches the user's guidance: a valid quiet-thinking window for
+// #126-class work, with only a hard cap as safety.
+const DEFAULT_IDLE_TIMEOUT_SECONDS = 30 * 60; // 1800 seconds
 const DEFAULT_COMPLETION_TIMEOUT_SECONDS = 60;
 
 export interface OrchestrateOptions {
@@ -417,7 +423,28 @@ export const orchestrate = (
                       ctx.sandboxRepoDir,
                     );
 
+                // Two-tier logging: operator log is concise, verbose log has full activity
+                const verboseLogPath = `.sandcastle/logs/${(ctx.sandbox as unknown as { branch?: string }).branch ?? "unknown"}.verbose.log`;
                 yield* display.status(label("Agent started"), "success");
+                yield* display.status(
+                  label(`  detailed activity: ${verboseLogPath}`),
+                  "info",
+                );
+                // Also log role/issue/branch if available from options (best-effort)
+                try {
+                  const role =
+                    (options as unknown as { role?: string }).role ??
+                    (ctx as unknown as { role?: string }).role ??
+                    "worker";
+                  const branch =
+                    (ctx.sandbox as unknown as { branch?: string }).branch ??
+                    (options as unknown as { branch?: string }).branch ??
+                    "unknown";
+                  yield* display.status(
+                    label(`  role: ${role} branch: ${branch}`),
+                    "info",
+                  );
+                } catch {}
 
                 // Invoke the agent — buffer text deltas so Pi's single-token
                 // chunks are displayed as readable multi-word lines.
@@ -458,12 +485,41 @@ export const orchestrate = (
                     }),
                   );
                 };
+                let lastActivityMs = Date.now();
                 const onIdleWarning = (minutes: number) => {
+                  const sinceSec = Math.round(
+                    (Date.now() - lastActivityMs) / 1000,
+                  );
                   const msg =
                     minutes === 1
-                      ? "Agent idle for 1 minute"
-                      : `Agent idle for ${minutes} minutes`;
+                      ? `Agent alive for 1m — last activity ${sinceSec}s ago`
+                      : `Agent alive for ${minutes}m — no observable output for ${sinceSec}s`;
                   Effect.runPromise(display.status(label(msg), "warn"));
+                  Effect.runPromise(
+                    display.status(
+                      label(`  verbose log: ${verboseLogPath}`),
+                      "info",
+                    ),
+                  );
+                };
+                // wrap activity touch
+                const _origOnText = onText;
+                const _origOnToolCall = onToolCall;
+                const _origOnRawLine = onRawLine;
+                const wrappedOnText = (text: string) => {
+                  lastActivityMs = Date.now();
+                  _origOnText(text);
+                };
+                const wrappedOnToolCall = (
+                  name: string,
+                  formattedArgs: string,
+                ) => {
+                  lastActivityMs = Date.now();
+                  _origOnToolCall(name, formattedArgs);
+                };
+                const wrappedOnRawLine = (line: string) => {
+                  lastActivityMs = Date.now();
+                  _origOnRawLine(line);
                 };
                 const onCompletionTimeout = (timeoutMs: number) => {
                   Effect.runPromise(
@@ -487,9 +543,9 @@ export const orchestrate = (
                   idleTimeoutMs,
                   completionTimeoutMs,
                   completionSignals,
-                  onText,
-                  onToolCall,
-                  onRawLine,
+                  wrappedOnText,
+                  wrappedOnToolCall,
+                  wrappedOnRawLine,
                   onIdleWarning,
                   onCompletionTimeout,
                   options._idleWarningIntervalMs,
