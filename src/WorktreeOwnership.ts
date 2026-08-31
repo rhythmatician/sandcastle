@@ -72,7 +72,7 @@ const validateAgainstRegistry = (
     if (registered === undefined) {
       return yield* failClosed(
         receipt,
-        `receipt token was not issued by any run in this process — the receipt is fabricated or from a dead process`,
+        `receipt token was not issued by any run in this process — the receipt is fabricated, revoked, or from a dead process`,
       );
     }
     if (
@@ -86,6 +86,16 @@ const validateAgainstRegistry = (
       );
     }
   });
+
+/**
+ * Revoke a receipt's token after terminal cleanup (removed or preserved).
+ * A revoked token can never authorize another destructive mutation — closing
+ * the replay edge where a same-path/same-branch worktree recreated later in
+ * the same long-running process could be deleted with a stale receipt.
+ */
+const revokeReceipt = (receipt: WorktreeOwnershipReceipt): void => {
+  receiptRegistry.delete(receipt.token);
+};
 
 const canonicalize = (p: string): Effect.Effect<string, WorktreeError> =>
   Effect.tryPromise({
@@ -230,6 +240,9 @@ export const removeVerified = (
       receipt.canonicalPath,
     ).pipe(Effect.catchAll(() => Effect.succeed(true)));
     if (dirty) {
+      // Terminal outcome: preserved. Revoke the token so this receipt can
+      // never authorize another destructive mutation.
+      revokeReceipt(receipt);
       return yield* failClosed(
         receipt,
         `worktree has uncommitted changes — preserving for inspection`,
@@ -281,6 +294,9 @@ export const removeVerified = (
         }),
       );
     }
+    // Terminal outcome: verified removal. Revoke the token — the worktree is
+    // gone and this receipt must never authorize anything again.
+    revokeReceipt(receipt);
   });
 
 /**

@@ -99,6 +99,56 @@ describe("WorktreeOwnership receipts", () => {
     expect(await worktreeListContains(repoDir, path)).toBe(false);
   });
 
+  it("a receipt is revoked after verified removal and cannot be replayed", async () => {
+    const repoDir = await setupRepo();
+    const { path, branch } = await run(create(repoDir));
+    const receipt = await run(
+      issueReceipt({ worktreePath: path, repoDir, branch }),
+    );
+
+    await run(removeVerified(receipt));
+
+    // Replay attempt: recreate a worktree at the same path/branch and try to
+    // reuse the old (now revoked) receipt to delete it.
+    const recreated = await run(create(repoDir, { branch }));
+    expect(recreated.path).toBe(path);
+
+    await expect(run(removeVerified(receipt))).rejects.toThrow(
+      /token was not issued by any run in this process/,
+    );
+
+    // The recreated worktree survives the replay attempt.
+    expect(existsSync(path)).toBe(true);
+
+    await run(remove(path));
+  });
+
+  it("a receipt is revoked after preservation (dirty) and cannot be replayed", async () => {
+    const repoDir = await setupRepo();
+    const { path, branch } = await run(create(repoDir));
+    const receipt = await run(
+      issueReceipt({ worktreePath: path, repoDir, branch }),
+    );
+
+    // Dirty the worktree so cleanup takes the preserve path.
+    await writeFile(join(path, "wip.txt"), "work");
+
+    await expect(run(removeVerified(receipt))).rejects.toThrow(
+      /preserving for inspection/,
+    );
+
+    // Clean the worktree so a replay would otherwise succeed.
+    await rm(join(path, "wip.txt"), { force: true });
+
+    await expect(run(removeVerified(receipt))).rejects.toThrow(
+      /token was not issued by any run in this process/,
+    );
+
+    expect(existsSync(path)).toBe(true);
+
+    await run(remove(path));
+  });
+
   it("fails closed when the worktree branch moved since the receipt was issued", async () => {
     const repoDir = await setupRepo();
     const { path, branch } = await run(create(repoDir));

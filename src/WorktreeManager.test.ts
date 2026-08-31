@@ -759,7 +759,7 @@ describe("WorktreeManager.pruneStale", () => {
     expect(stdout).not.toContain(path);
   });
 
-  it("removes orphaned directories under .sandcastle/worktrees/", async () => {
+  it("preserves orphaned directories under .sandcastle/worktrees/ (non-destructive without ownership evidence)", async () => {
     const repoDir = await setupRepo();
     const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
     await mkdir(worktreesDir, { recursive: true });
@@ -770,8 +770,10 @@ describe("WorktreeManager.pruneStale", () => {
 
     await run(pruneStale(repoDir));
 
+    // Ownership cannot be proven for a directory this process did not
+    // create — it must survive pruning.
     const entries = await readdir(worktreesDir).catch(() => []);
-    expect(entries).not.toContain("orphan-dir");
+    expect(entries).toContain("orphan-dir");
   });
 
   it("does not remove active worktrees", async () => {
@@ -846,12 +848,14 @@ describe("WorktreeManager.pruneStale", () => {
     expect(content).toBe("unknown provenance");
   });
 
-  it("still removes a clean orphaned directory and verifies the removal", async () => {
+  it("preserves an unowned-but-clean orphan directory (regression: clean orphans were auto-deleted)", async () => {
     const repoDir = await setupRepo();
     const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
     await mkdir(worktreesDir, { recursive: true });
 
-    // A clean orphan: init a repo and commit so the dirty check passes.
+    // A completely separate clean git repository placed under the managed
+    // worktrees dir. It looks like a sandcastle orphan and is clean, but
+    // this process has no ownership evidence for it — it must survive.
     const orphanDir = join(worktreesDir, "orphan-clean");
     await mkdir(orphanDir);
     await execAsync("git init -b main", { cwd: orphanDir });
@@ -865,8 +869,10 @@ describe("WorktreeManager.pruneStale", () => {
 
     await run(pruneStale(repoDir));
 
-    const entries = await readdir(worktreesDir).catch(() => []);
-    expect(entries).not.toContain("orphan-clean");
+    const s = await stat(orphanDir);
+    expect(s.isDirectory()).toBe(true);
+    const content = await readFile(join(orphanDir, "f.txt"), "utf-8");
+    expect(content).toBe("x");
   });
 });
 

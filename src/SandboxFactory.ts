@@ -376,20 +376,23 @@ export const WorktreeDockerSandboxFactory = {
       const display = yield* Display;
 
       /**
-       * Prune stale worktrees (best-effort), then create a fresh one and
-       * issue this run's ownership receipt for it. The receipt is the only
-       * authority the release phase has to destructively remove the
-       * worktree later.
+       * Prune stale worktrees, then create a fresh one and issue this run's
+       * ownership receipt for it. The receipt is the only authority the
+       * release phase has to destructively remove the worktree later.
+       *
+       * A prune failure is NOT swallowed: uncertain external state must stop
+       * progression (issue #6) — creating a new worktree on top of an
+       * unverified stale-worktree state would compound the uncertainty.
        */
       const pruneAndCreate = () =>
         WorktreeManager.pruneStale(hostRepoDir, timeouts?.worktreeMs).pipe(
-          Effect.catchAll((e) =>
-            Effect.sync(() => {
-              console.error(
-                "[sandcastle] Warning: failed to prune stale worktrees:",
-                e.message,
-              );
-            }),
+          Effect.mapError(
+            (e) =>
+              new WorktreeError({
+                message:
+                  `Aborting before worktree creation: stale-worktree prune failed — ` +
+                  `external state is uncertain. ${e.message}`,
+              }),
           ),
           Effect.andThen(
             branch
