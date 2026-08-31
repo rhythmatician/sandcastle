@@ -57,6 +57,11 @@ import {
 import { noSandbox } from "./sandboxes/no-sandbox.js";
 import { raceAbortSignal } from "./raceAbortSignal.js";
 import type { Timeouts } from "./run.js";
+import {
+  issueReceipt,
+  removeVerified,
+  type WorktreeOwnershipReceipt,
+} from "./WorktreeOwnership.js";
 
 /** Branch strategies valid for createWorktree — head is excluded. */
 export type WorktreeBranchStrategy =
@@ -231,7 +236,7 @@ export const createWorktree = async (
   // `keepSourceBranch: true` (so the worktree's source branch survives).
   const isMergeToHead = options.branchStrategy.type === "merge-to-head";
 
-  const { hostRepoDir, worktreeInfo } = await Effect.gen(function* () {
+  const { hostRepoDir, worktreeInfo, receipt } = await Effect.gen(function* () {
     const hostRepoDir = yield* resolveCwd(options.cwd);
     yield* WorktreeManager.pruneStale(hostRepoDir).pipe(
       Effect.catchAll(() => Effect.void),
@@ -239,6 +244,11 @@ export const createWorktree = async (
     const info = yield* WorktreeManager.create(hostRepoDir, {
       branch,
       baseBranch,
+    });
+    const receipt = yield* issueReceipt({
+      worktreePath: info.path,
+      repoDir: hostRepoDir,
+      branch: info.branch,
     });
     if (options.copyToWorktree && options.copyToWorktree.length > 0) {
       yield* copyToWorktree(
@@ -252,7 +262,7 @@ export const createWorktree = async (
     if (options.hooks?.host?.onWorktreeReady?.length) {
       yield* runHostHooks(options.hooks.host.onWorktreeReady, info.path);
     }
-    return { hostRepoDir, worktreeInfo: info };
+    return { hostRepoDir, worktreeInfo: info, receipt };
   }).pipe(Effect.provide(NodeContext.layer), Effect.runPromise);
 
   let closed = false;
@@ -270,8 +280,16 @@ export const createWorktree = async (
         return { preservedWorktreePath: worktreeInfo.path } as CloseResult;
       }
 
-      yield* WorktreeManager.remove(worktreeInfo.path).pipe(
-        Effect.catchAll(() => Effect.void),
+      // Destructive removal is guarded by this run's ownership receipt and
+      // freshly re-read postconditions (see WorktreeOwnership). A failed
+      // verification leaves the worktree untouched and surfaces the error.
+      yield* removeVerified(receipt).pipe(
+        Effect.catchAll((e) => {
+          console.error(
+            `\n[sandcastle] Cleanup skipped (fail-closed): ${e.message}`,
+          );
+          return Effect.void;
+        }),
       );
 
       return { preservedWorktreePath: undefined } as CloseResult;

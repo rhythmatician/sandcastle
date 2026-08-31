@@ -474,12 +474,52 @@ export const withSandboxLifecycle = <A>(
       // Delete the temp branch (now merged into host branch). Skipped when
       // `keepSourceBranch` is set: the source branch is the worktree's active
       // branch and the worktree's lifetime outlives the lifecycle.
+      //
+      // Read-before-write guard: freshly re-read the branch tip immediately
+      // before deletion and confirm it is an ancestor of the host branch
+      // (i.e. the merge actually landed). If the branch moved since the merge
+      // or the merge did not land, refuse to delete — a stale branch whose
+      // state is unknown must never be force-deleted.
       if (!options.keepSourceBranch) {
-        yield* Effect.promise(() =>
-          execAsync(`git branch -D "${resolvedBranch}"`, {
-            cwd: hostRepoDir,
-          }).catch(() => {}),
-        );
+        const branchTip = yield* Effect.promise(async () => {
+          try {
+            const { stdout } = await execAsync(
+              `git rev-parse "refs/heads/${resolvedBranch}"`,
+              { cwd: hostRepoDir },
+            );
+            return stdout.trim();
+          } catch {
+            return null; // branch already gone — nothing to delete
+          }
+        });
+        if (branchTip !== null) {
+          const isMerged = yield* Effect.promise(async () => {
+            try {
+              const { stdout } = await execAsync(
+                `git merge-base --is-ancestor "${branchTip}" "${hostCurrentBranch}"`,
+                { cwd: hostRepoDir },
+              );
+              return true;
+            } catch {
+              return false;
+            }
+          });
+          if (!isMerged) {
+            yield* Effect.fail(
+              new SyncError({
+                message:
+                  `Refusing to delete temporary branch '${resolvedBranch}': its tip ` +
+                  `${branchTip.slice(0, 12)} is not an ancestor of '${hostCurrentBranch}'. ` +
+                  `The branch may contain unmerged work — it has been preserved for inspection.`,
+              }),
+            );
+          }
+          yield* Effect.promise(() =>
+            execAsync(`git branch -D "${resolvedBranch}"`, {
+              cwd: hostRepoDir,
+            }).catch(() => {}),
+          );
+        }
       }
 
       // Collect the commits now on the host branch

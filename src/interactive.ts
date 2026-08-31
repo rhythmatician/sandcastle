@@ -43,6 +43,11 @@ import { noSandbox } from "./sandboxes/no-sandbox.js";
 import { raceAbortSignal } from "./raceAbortSignal.js";
 import { resolveCwd } from "./resolveCwd.js";
 import type { Timeouts } from "./run.js";
+import {
+  issueReceipt,
+  removeVerified,
+  type WorktreeOwnershipReceipt,
+} from "./WorktreeOwnership.js";
 
 export interface InteractiveOptions {
   /** Agent provider to use (e.g. claudeCode("claude-opus-4-8")) */
@@ -247,9 +252,10 @@ export const interactive = async (
 
     // 5. Create worktree (unless head mode)
     let worktreeInfo: WorktreeManager.WorktreeInfo | undefined;
+    let receipt: WorktreeOwnershipReceipt | undefined;
 
     if (!isHeadMode) {
-      worktreeInfo = yield* d.taskLog("Creating worktree", () =>
+      const created = yield* d.taskLog("Creating worktree", () =>
         WorktreeManager.pruneStale(hostRepoDir).pipe(
           Effect.catchAll(() => Effect.void),
           Effect.andThen(
@@ -257,8 +263,17 @@ export const interactive = async (
               ? WorktreeManager.create(hostRepoDir, { branch })
               : WorktreeManager.create(hostRepoDir, { name: options.name }),
           ),
+          Effect.andThen((info) =>
+            issueReceipt({
+              worktreePath: info.path,
+              repoDir: hostRepoDir,
+              branch: info.branch,
+            }).pipe(Effect.map((r) => ({ info, receipt: r }))),
+          ),
         ),
       );
+      worktreeInfo = created.info;
+      receipt = created.receipt;
     }
 
     // 6. Prepare the worktree and start the sandbox. If any step fails after the
@@ -340,9 +355,15 @@ export const interactive = async (
       }
     }).pipe(
       Effect.tapError(() =>
-        worktreeInfo
-          ? WorktreeManager.remove(worktreeInfo.path).pipe(
-              Effect.catchAll(() => Effect.void),
+        worktreeInfo && receipt
+          ? removeVerified(receipt).pipe(
+              Effect.catchAll((e) =>
+                Effect.sync(() => {
+                  console.error(
+                    `\n[sandcastle] Cleanup skipped (fail-closed): ${e.message}`,
+                  );
+                }),
+              ),
             )
           : Effect.void,
       ),
@@ -430,9 +451,15 @@ export const interactive = async (
       }
 
       // Clean up worktree if not preserved
-      if (worktreeInfo && !preservedWorktreePath) {
-        yield* WorktreeManager.remove(worktreeInfo.path).pipe(
-          Effect.catchAll(() => Effect.void),
+      if (worktreeInfo && receipt && !preservedWorktreePath) {
+        yield* removeVerified(receipt).pipe(
+          Effect.catchAll((e) =>
+            Effect.sync(() => {
+              console.error(
+                `\n[sandcastle] Cleanup skipped (fail-closed): ${e.message}`,
+              );
+            }),
+          ),
         );
       }
 
@@ -455,9 +482,15 @@ export const interactive = async (
     }).pipe(
       // On error, always clean up worktree (on success, handled above with preserve check)
       Effect.tapError(() =>
-        worktreeInfo
-          ? WorktreeManager.remove(worktreeInfo.path).pipe(
-              Effect.catchAll(() => Effect.void),
+        worktreeInfo && receipt
+          ? removeVerified(receipt).pipe(
+              Effect.catchAll((e) =>
+                Effect.sync(() => {
+                  console.error(
+                    `\n[sandcastle] Cleanup skipped (fail-closed): ${e.message}`,
+                  );
+                }),
+              ),
             )
           : Effect.void,
       ),

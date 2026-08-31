@@ -28,6 +28,11 @@ import { runHostHooks, type SandboxHooks } from "./SandboxLifecycle.js";
 import { startSandbox } from "./startSandbox.js";
 import { syncOut } from "./syncOut.js";
 import { patchGitMountsForWindows } from "./mountUtils.js";
+import {
+  issueReceipt,
+  removeVerified,
+  type WorktreeOwnershipReceipt,
+} from "./WorktreeOwnership.js";
 
 export interface ExecResult {
   readonly stdout: string;
@@ -199,10 +204,17 @@ const printWorktreePreservedMessage = (
 /**
  * Check for uncommitted changes and either preserve or remove the worktree.
  * Returns the preserved path if preserved, undefined if removed.
+ *
+ * Destructive removal is guarded by the run's ownership receipt: the
+ * worktree's freshly re-read state (registration, branch, directory) must
+ * still match what this run created, and the path must sit inside the
+ * managed `.sandcastle/worktrees/` directory. Any mismatch fails closed —
+ * nothing is mutated and the error carries the primary failure's context.
  */
 const cleanupWorktree = (
   worktreePath: string,
   exit: Exit.Exit<unknown, unknown>,
+  receipt: WorktreeOwnershipReceipt | undefined,
 ): Effect.Effect<string | undefined, WorktreeError> =>
   WorktreeManager.hasUncommittedChanges(worktreePath).pipe(
     Effect.catchAll(() => Effect.succeed(false)),
@@ -219,10 +231,57 @@ const cleanupWorktree = (
       if (!Exit.isSuccess(exit)) {
         console.error(`\nWorktree removed (no uncommitted changes)`);
       }
-      return WorktreeManager.remove(worktreePath).pipe(
+      if (receipt === undefined) {
+        // No receipt means this run did not provably create the worktree —
+        // fail closed rather than guessing ownership from a path name.
+        return Effect.fail(
+          new WorktreeError({
+            message:
+              `Refusing destructive cleanup of ${worktreePath}: no ownership receipt was issued by this run. ` +
+              `The worktree is preserved for manual inspection.`,
+          }),
+        );
+      }
+      return removeVerified(receipt).pipe(
         Effect.map(() => undefined as string | undefined),
       );
     }),
+  );
+
+/**
+ * Cleanup-failure precedence (invariant 5): a cleanup failure must never
+ * erase the primary worker/factory failure, and must never let the run
+ * report success while external state is uncertain.
+ *
+ * - Primary failure present → re-fail with the primary error; the cleanup
+ *   diagnostic is logged so it is retained for the operator.
+ * - Primary success but cleanup failed → fail closed with an infrastructure
+ *   error carrying the cleanup diagnostic. The run did NOT complete cleanly.
+ */
+const handleCleanupFailure = (
+  cleanupError: WorktreeError,
+  exit: Exit.Exit<unknown, unknown>,
+): Effect.Effect<never> =>
+  Effect.sync(() => {
+    console.error(
+      `\n[sandcastle] Cleanup failed (fail-closed): ${cleanupError.message}`,
+    );
+    if (Exit.isSuccess(exit)) {
+      console.error(
+        `[sandcastle] The run's work completed, but cleanup could not be verified. ` +
+          `Treating the run as failed — inspect the worktree before retrying.`,
+      );
+    }
+  }).pipe(
+    Effect.flatMap(() =>
+      Exit.isSuccess(exit)
+        ? Effect.fail(cleanupError)
+        : Effect.die(
+            new WorktreeError({
+              message: `Primary failure retained; cleanup also failed: ${cleanupError.message}`,
+            }),
+          ),
+    ),
   );
 
 /**
@@ -313,7 +372,12 @@ export const WorktreeDockerSandboxFactory = {
       const fileSystem = yield* FileSystem.FileSystem;
       const display = yield* Display;
 
-      /** Prune stale worktrees (best-effort), then create a fresh one. */
+      /**
+       * Prune stale worktrees (best-effort), then create a fresh one and
+       * issue this run's ownership receipt for it. The receipt is the only
+       * authority the release phase has to destructively remove the
+       * worktree later.
+       */
       const pruneAndCreate = () =>
         WorktreeManager.pruneStale(hostRepoDir, timeouts?.worktreeMs).pipe(
           Effect.catchAll((e) =>
@@ -335,6 +399,13 @@ export const WorktreeDockerSandboxFactory = {
                   name,
                   timeoutMs: timeouts?.worktreeMs,
                 }),
+          ),
+          Effect.andThen((worktreeInfo) =>
+            issueReceipt({
+              worktreePath: worktreeInfo.path,
+              repoDir: hostRepoDir,
+              branch: worktreeInfo.branch,
+            }).pipe(Effect.map((receipt) => ({ worktreeInfo, receipt }))),
           ),
           Effect.provideService(FileSystem.FileSystem, fileSystem),
         );
@@ -398,7 +469,7 @@ export const WorktreeDockerSandboxFactory = {
             // closed by the inner release, which only runs once it exists.
             return Effect.acquireUseRelease(
               pruneAndCreate(),
-              (worktreeInfo) =>
+              ({ worktreeInfo }) =>
                 (copyPaths && copyPaths.length > 0
                   ? display.spinner(
                       "Copying to worktree",
@@ -444,13 +515,15 @@ export const WorktreeDockerSandboxFactory = {
                     ),
                   ),
                 ) as Effect.Effect<A, E | SandboxError, R>,
-              (worktreeInfo, exit) =>
-                cleanupWorktree(worktreeInfo.path, exit).pipe(
+              ({ worktreeInfo, receipt }, exit) =>
+                cleanupWorktree(worktreeInfo.path, exit, receipt).pipe(
                   Effect.tap((p) => {
                     preservedPath = p;
                   }),
+                  Effect.catchAll((cleanupError) =>
+                    handleCleanupFailure(cleanupError, exit),
+                  ),
                   Effect.asVoid,
-                  Effect.orDie,
                 ),
             ).pipe(
               Effect.map((value) => ({
@@ -472,7 +545,7 @@ export const WorktreeDockerSandboxFactory = {
             // the inner release, which only runs once it exists.
             return Effect.acquireUseRelease(
               pruneAndCreate(),
-              (worktreeInfo) =>
+              ({ worktreeInfo }) =>
                 (hooks?.host?.onWorktreeReady?.length
                   ? runHostHooks(
                       hooks.host.onWorktreeReady,
@@ -510,13 +583,15 @@ export const WorktreeDockerSandboxFactory = {
                     ),
                   ),
                 ) as Effect.Effect<A, E | SandboxError, R>,
-              (worktreeInfo, exit) =>
-                cleanupWorktree(worktreeInfo.path, exit).pipe(
+              ({ worktreeInfo, receipt }, exit) =>
+                cleanupWorktree(worktreeInfo.path, exit, receipt).pipe(
                   Effect.tap((p) => {
                     preservedPath = p;
                   }),
+                  Effect.catchAll((cleanupError) =>
+                    handleCleanupFailure(cleanupError, exit),
+                  ),
                   Effect.asVoid,
-                  Effect.orDie,
                 ),
             ).pipe(
               Effect.map((value) => ({
@@ -603,7 +678,7 @@ export const WorktreeDockerSandboxFactory = {
             pruneAndCreate(),
             // Use: copy files, run host hooks, resolve+patch git mounts, then start
             // the sandbox under a nested acquireUseRelease.
-            (worktreeInfo) =>
+            ({ worktreeInfo }) =>
               (copyPaths && copyPaths.length > 0
                 ? display.spinner(
                     "Copying to worktree",
@@ -674,13 +749,15 @@ export const WorktreeDockerSandboxFactory = {
                 ),
               ) as Effect.Effect<A, E | SandboxError, R>,
             // Release: remove or preserve the worktree based on dirty state.
-            (worktreeInfo, exit) =>
-              cleanupWorktree(worktreeInfo.path, exit).pipe(
+            ({ worktreeInfo, receipt }, exit) =>
+              cleanupWorktree(worktreeInfo.path, exit, receipt).pipe(
                 Effect.tap((p) => {
                   preservedWorktreePath = p;
                 }),
+                Effect.catchAll((cleanupError) =>
+                  handleCleanupFailure(cleanupError, exit),
+                ),
                 Effect.asVoid,
-                Effect.orDie,
               ),
           ).pipe(
             Effect.map((value) => ({
