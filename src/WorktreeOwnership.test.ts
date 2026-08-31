@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import type { FileSystem } from "@effect/platform";
 import { NodeFileSystem } from "@effect/platform-node";
 import { exec } from "node:child_process";
 import {
@@ -24,8 +25,17 @@ import {
 
 const execAsync = promisify(exec);
 
-const run = <A, E>(effect: Effect.Effect<A, E, never>) =>
-  Effect.runPromise(Effect.provide(effect, NodeFileSystem.layer));
+const run = <A, E>(
+  effect:
+    | Effect.Effect<A, E, never>
+    | Effect.Effect<A, E, FileSystem.FileSystem>,
+) =>
+  Effect.runPromise(
+    Effect.provide(
+      effect as Effect.Effect<A, E, FileSystem.FileSystem>,
+      NodeFileSystem.layer,
+    ),
+  ) as Promise<A>;
 
 const initRepo = async (dir: string) => {
   await execAsync("git init -b main", { cwd: dir });
@@ -188,10 +198,11 @@ describe("Lifecycle safety: remote-write-free and worktree containment", () => {
         `@echo off\r\nif "%~1"=="push" echo push >> "${logPath}"\r\ngit.exe %*\r\n`,
       );
     } else {
+      const realGit = await execAsync("which git").then((r) => r.stdout.trim());
       const shim = join(shimDir, "git");
       await writeFile(
         shim,
-        `#!/bin/sh\nif [ "$1" = "push" ]; then echo push >> "${logPath}"; fi\nexec git.real "$@"\n`,
+        `#!/bin/sh\nif [ "$1" = "push" ]; then echo push >> "${logPath}"; fi\nexec "${realGit}" "$@"\n`,
       );
       await execAsync(`chmod +x "${shim}"`);
     }

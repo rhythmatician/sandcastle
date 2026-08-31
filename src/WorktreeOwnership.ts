@@ -90,13 +90,14 @@ export const verifyOwnership = (
 
     // Fresh read #3: the directory must still exist on disk. A vanished
     // directory with live git metadata is ambiguous — refuse to guess.
-    const exists = yield* Effect.tryPromise({
-      try: async () => {
+    const exists = yield* Effect.promise(async () => {
+      try {
         const { stat } = await import("node:fs/promises");
         const s = await stat(receipt.canonicalPath);
         return s.isDirectory();
-      },
-      catch: () => false,
+      } catch {
+        return false;
+      }
     });
     if (!exists) {
       return yield* failClosed(
@@ -161,15 +162,31 @@ const findRegisteredWorktree = (
   });
 
 /**
- * Guarded destructive cleanup: verify ownership, then remove the worktree,
- * then freshly re-read state to confirm the removal actually happened.
- * Read-after-write: a successful exit code alone is not proof.
+ * Guarded destructive cleanup: verify ownership, verify the worktree holds no
+ * uncommitted work (interrupted runs must be preserved, never deleted), then
+ * remove the worktree, then freshly re-read state to confirm the removal
+ * actually happened. Read-after-write: a successful exit code alone is not
+ * proof.
  */
 export const removeVerified = (
   receipt: WorktreeOwnershipReceipt,
 ): Effect.Effect<void, WorktreeError> =>
   Effect.gen(function* () {
     yield* verifyOwnership(receipt);
+
+    // Fresh read #4: uncommitted work check immediately before deletion.
+    // Committed or uncommitted agent work in an owned worktree is preserved
+    // for human inspection — cleanup never destroys it.
+    const dirty = yield* WorktreeManager.hasUncommittedChanges(
+      receipt.canonicalPath,
+    ).pipe(Effect.catchAll(() => Effect.succeed(true)));
+    if (dirty) {
+      return yield* failClosed(
+        receipt,
+        `worktree has uncommitted changes — preserving for inspection`,
+      );
+    }
+
     yield* WorktreeManager.remove(receipt.canonicalPath);
     // Read-after-write: the worktree must no longer be registered.
     const stillRegistered = yield* findRegisteredWorktree(

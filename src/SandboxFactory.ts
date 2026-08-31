@@ -273,14 +273,17 @@ const handleCleanupFailure = (
       );
     }
   }).pipe(
-    Effect.flatMap(() =>
-      Exit.isSuccess(exit)
-        ? Effect.fail(cleanupError)
-        : Effect.die(
-            new WorktreeError({
-              message: `Primary failure retained; cleanup also failed: ${cleanupError.message}`,
-            }),
-          ),
+    // Dying (defect) rather than failing: Effect.acquireUseRelease requires a
+    // total release, and a defect raised in the release is *combined* with the
+    // primary use-phase failure instead of replacing it — so the primary
+    // failure stays primary (invariant 5). When the run had succeeded, the
+    // defect propagates and the run reports failure (invariant 6).
+    Effect.andThen(
+      Effect.die(
+        new WorktreeError({
+          message: `Cleanup failed (fail-closed): ${cleanupError.message}`,
+        }),
+      ),
     ),
   );
 

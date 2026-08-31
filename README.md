@@ -344,6 +344,8 @@ await sandbox.run({
 
 `await using` calls `sandbox.close()` automatically when the block exits. If the sandbox has uncommitted changes, the worktree is preserved on disk; if clean, both container and worktree are removed.
 
+Cleanup is fail-closed: destructive removal only happens when the run's ownership receipt still matches freshly re-read git state (worktree registration, branch, directory). If state is unknown or contradictory — or the worktree holds uncommitted work — nothing is mutated, the worktree is preserved, and the reason is printed. Cleanup never touches the caller's working tree or sibling worktrees, and no lifecycle path performs remote git writes.
+
 #### Manual `close()` with `CloseResult`
 
 ```typescript
