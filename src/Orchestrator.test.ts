@@ -21,7 +21,7 @@ import { substitutePromptArgs } from "./PromptArgumentSubstitution.js";
 import {
   claudeCode,
   codex as codexFactory,
-  muse,
+  muse as museFactory,
   opencode as opencodeFactory,
   pi as piFactory,
   DEFAULT_MODEL,
@@ -1471,7 +1471,7 @@ describe("Orchestrator error handling", () => {
     await initRepo(hostDir);
     await commitFile(hostDir, "hello.txt", "hello", "initial commit");
 
-    const provider = muse("muse-spark-1.2");
+    const provider = museFactory("muse-spark-1.2");
     const assistantText =
       '<verdict>{"approved":true,"findings":[],"acceptanceCriteriaMet":[{"criterion":"#151 contract","met":true,"evidence":"focused suites green"}],"summary":"Functional contract fully met."}</verdict>\n<promise>COMPLETE</promise>';
     const rawLines = [
