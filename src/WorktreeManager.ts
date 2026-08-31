@@ -460,8 +460,22 @@ export const remove = (
 };
 
 /**
- * Prunes stale git worktree metadata and removes orphaned directories under
+ * Prunes stale git worktree metadata and reports orphaned directories under
  * `.sandcastle/worktrees/`.
+ *
+ * Ownership policy (issue #6): destructive cleanup requires run-owned
+ * identity/receipt — "managed-directory naming + appears clean + not
+ * registered" is NOT authority. A clean orphan directory under
+ * `.sandcastle/worktrees/` may belong to a concurrent run in another process
+ * whose git metadata is momentarily stale, or to a foreign project entirely.
+ * This process cannot prove ownership of it, so it is never deleted here.
+ * Orphans are reported for manual cleanup instead.
+ *
+ * What this function still does:
+ * - `git worktree prune` — git's own metadata GC for worktrees whose
+ *   directories are already gone. This touches no working files.
+ * - Fresh-read preservation reporting for every orphan: dirty or unreadable
+ *   state is surfaced with recovery instructions.
  */
 export const pruneStale = (
   repoDir: string,
@@ -512,23 +526,31 @@ export const pruneStale = (
         .map((line) => line.slice("worktree ".length).trim()),
     );
 
-    // Remove any directory under .sandcastle/worktrees/ that is not an active worktree
+    // Report every orphan — never delete. Ownership cannot be proven for a
+    // directory this process did not create, regardless of cleanliness.
     for (const entry of entries) {
       const entryPath = join(realWorktreesDir, entry);
       const isDir = yield* fs.stat(entryPath).pipe(
         Effect.map((s) => s.type === "Directory"),
         Effect.catchAll(() => Effect.succeed(false)),
       );
-      if (isDir && isOrphanedWorktreePath(entryPath, activeWorktreePaths)) {
-        yield* fs.remove(entryPath, { recursive: true, force: true }).pipe(
-          Effect.mapError(
-            (e) =>
-              new WorktreeError({
-                message: `Failed to remove ${entryPath}: ${e.message}`,
-              }),
-          ),
-        );
-      }
+      if (!isDir) continue;
+      if (!isOrphanedWorktreePath(entryPath, activeWorktreePaths)) continue;
+
+      // Fresh read: does the orphan hold uncommitted work? Unknown state
+      // (git fails, not a repo, unreadable) counts as dirty — report as such.
+      const dirty = yield* hasUncommittedChanges(entryPath).pipe(
+        Effect.catchAll(() => Effect.succeed(true)),
+      );
+      console.warn(
+        `[sandcastle] Found orphaned worktree directory ${entryPath} ` +
+          (dirty
+            ? `with uncommitted changes (or unreadable state) — preserved. `
+            : `(clean, but ownership cannot be proven by this process) — preserved. `) +
+          `Sandcastle no longer auto-deletes orphans: verify it belongs to no ` +
+          `active run, then remove manually with: git worktree remove --force ${entryPath} ` +
+          `or rm -rf ${entryPath}`,
+      );
     }
   }).pipe(
     withTimeout(

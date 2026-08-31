@@ -759,7 +759,7 @@ describe("WorktreeManager.pruneStale", () => {
     expect(stdout).not.toContain(path);
   });
 
-  it("removes orphaned directories under .sandcastle/worktrees/", async () => {
+  it("preserves orphaned directories under .sandcastle/worktrees/ (non-destructive without ownership evidence)", async () => {
     const repoDir = await setupRepo();
     const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
     await mkdir(worktreesDir, { recursive: true });
@@ -770,8 +770,10 @@ describe("WorktreeManager.pruneStale", () => {
 
     await run(pruneStale(repoDir));
 
+    // Ownership cannot be proven for a directory this process did not
+    // create — it must survive pruning.
     const entries = await readdir(worktreesDir).catch(() => []);
-    expect(entries).not.toContain("orphan-dir");
+    expect(entries).toContain("orphan-dir");
   });
 
   it("does not remove active worktrees", async () => {
@@ -806,6 +808,71 @@ describe("WorktreeManager.pruneStale", () => {
     expect(s.isDirectory()).toBe(true);
 
     await run(remove(path));
+  });
+
+  it("preserves an orphaned directory that contains uncommitted work (fail-closed)", async () => {
+    const repoDir = await setupRepo();
+    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+    await mkdir(worktreesDir, { recursive: true });
+
+    // An orphaned directory holding what looks like unmerged agent work.
+    const orphanDir = join(worktreesDir, "orphan-with-work");
+    await mkdir(orphanDir);
+    await writeFile(join(orphanDir, "wip.txt"), "unmerged work");
+
+    await run(pruneStale(repoDir));
+
+    // Preserved, not deleted.
+    const s = await stat(orphanDir);
+    expect(s.isDirectory()).toBe(true);
+    const content = await readFile(join(orphanDir, "wip.txt"), "utf-8");
+    expect(content).toBe("unmerged work");
+  });
+
+  it("preserves an orphaned directory whose state cannot be read (unknown → preserve)", async () => {
+    const repoDir = await setupRepo();
+    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+    await mkdir(worktreesDir, { recursive: true });
+
+    // An orphaned directory that is not a git repo at all — the dirty check
+    // cannot succeed, so the state is unknown and must be preserved.
+    const orphanDir = join(worktreesDir, "orphan-not-a-repo");
+    await mkdir(orphanDir);
+    await writeFile(join(orphanDir, "mystery.txt"), "unknown provenance");
+
+    await run(pruneStale(repoDir));
+
+    const s = await stat(orphanDir);
+    expect(s.isDirectory()).toBe(true);
+    const content = await readFile(join(orphanDir, "mystery.txt"), "utf-8");
+    expect(content).toBe("unknown provenance");
+  });
+
+  it("preserves an unowned-but-clean orphan directory (regression: clean orphans were auto-deleted)", async () => {
+    const repoDir = await setupRepo();
+    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+    await mkdir(worktreesDir, { recursive: true });
+
+    // A completely separate clean git repository placed under the managed
+    // worktrees dir. It looks like a sandcastle orphan and is clean, but
+    // this process has no ownership evidence for it — it must survive.
+    const orphanDir = join(worktreesDir, "orphan-clean");
+    await mkdir(orphanDir);
+    await execAsync("git init -b main", { cwd: orphanDir });
+    await execAsync('git config user.email "test@test.com"', {
+      cwd: orphanDir,
+    });
+    await execAsync('git config user.name "Test"', { cwd: orphanDir });
+    await writeFile(join(orphanDir, "f.txt"), "x");
+    await execAsync("git add f.txt", { cwd: orphanDir });
+    await execAsync('git commit -m "clean"', { cwd: orphanDir });
+
+    await run(pruneStale(repoDir));
+
+    const s = await stat(orphanDir);
+    expect(s.isDirectory()).toBe(true);
+    const content = await readFile(join(orphanDir, "f.txt"), "utf-8");
+    expect(content).toBe("x");
   });
 });
 

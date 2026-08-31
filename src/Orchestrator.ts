@@ -209,8 +209,31 @@ const invokeAgent = (
         );
       }
 
+      // Output resolution order:
+      // 1. resultText — the provider's terminal result event (authoritative).
+      // 2. accumulatedOutput — reconstructed stream text (Muse emits deltas
+      //    with no terminal result event; see 767752b).
+      // 3. raw stdout — the original fallback for providers whose stream has
+      //    no result line at all.
+      //
+      // Guard: a completion signal present in raw stdout must never be lost
+      // just because a parsed text delta was buffered first. If the chosen
+      // output doesn't contain the signal but stdout does, prefer stdout —
+      // otherwise the orchestrator would miss completion and burn extra
+      // iterations (regression caught by "falls back to stdout when stream
+      // has no result line").
+      const chosen = resultText || accumulatedOutput || execResult.stdout;
+      const signalInStdout = completionSignals.some((sig) =>
+        execResult.stdout.includes(sig),
+      );
+      const signalInChosen = completionSignals.some((sig) =>
+        chosen.includes(sig),
+      );
+      const result =
+        signalInStdout && !signalInChosen ? execResult.stdout : chosen;
+
       return {
-        result: resultText || accumulatedOutput || execResult.stdout,
+        result,
         sessionId,
         usage,
       };

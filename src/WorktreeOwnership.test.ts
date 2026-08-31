@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import type { FileSystem } from "@effect/platform";
 import { NodeFileSystem } from "@effect/platform-node";
 import { exec } from "node:child_process";
 import {
@@ -24,8 +25,17 @@ import {
 
 const execAsync = promisify(exec);
 
-const run = <A, E>(effect: Effect.Effect<A, E, never>) =>
-  Effect.runPromise(Effect.provide(effect, NodeFileSystem.layer));
+const run = <A, E>(
+  effect:
+    | Effect.Effect<A, E, never>
+    | Effect.Effect<A, E, FileSystem.FileSystem>,
+) =>
+  Effect.runPromise(
+    Effect.provide(
+      effect as Effect.Effect<A, E, FileSystem.FileSystem>,
+      NodeFileSystem.layer,
+    ),
+  ) as Promise<A>;
 
 const initRepo = async (dir: string) => {
   await execAsync("git init -b main", { cwd: dir });
@@ -89,6 +99,56 @@ describe("WorktreeOwnership receipts", () => {
     expect(await worktreeListContains(repoDir, path)).toBe(false);
   });
 
+  it("a receipt is revoked after verified removal and cannot be replayed", async () => {
+    const repoDir = await setupRepo();
+    const { path, branch } = await run(create(repoDir));
+    const receipt = await run(
+      issueReceipt({ worktreePath: path, repoDir, branch }),
+    );
+
+    await run(removeVerified(receipt));
+
+    // Replay attempt: recreate a worktree at the same path/branch and try to
+    // reuse the old (now revoked) receipt to delete it.
+    const recreated = await run(create(repoDir, { branch }));
+    expect(recreated.path).toBe(path);
+
+    await expect(run(removeVerified(receipt))).rejects.toThrow(
+      /token was not issued by any run in this process/,
+    );
+
+    // The recreated worktree survives the replay attempt.
+    expect(existsSync(path)).toBe(true);
+
+    await run(remove(path));
+  });
+
+  it("a receipt is revoked after preservation (dirty) and cannot be replayed", async () => {
+    const repoDir = await setupRepo();
+    const { path, branch } = await run(create(repoDir));
+    const receipt = await run(
+      issueReceipt({ worktreePath: path, repoDir, branch }),
+    );
+
+    // Dirty the worktree so cleanup takes the preserve path.
+    await writeFile(join(path, "wip.txt"), "work");
+
+    await expect(run(removeVerified(receipt))).rejects.toThrow(
+      /preserving for inspection/,
+    );
+
+    // Clean the worktree so a replay would otherwise succeed.
+    await rm(join(path, "wip.txt"), { force: true });
+
+    await expect(run(removeVerified(receipt))).rejects.toThrow(
+      /token was not issued by any run in this process/,
+    );
+
+    expect(existsSync(path)).toBe(true);
+
+    await run(remove(path));
+  });
+
   it("fails closed when the worktree branch moved since the receipt was issued", async () => {
     const repoDir = await setupRepo();
     const { path, branch } = await run(create(repoDir));
@@ -142,6 +202,53 @@ describe("WorktreeOwnership receipts", () => {
     );
   });
 
+  it("a fabricated receipt with correct path/repo/branch but an arbitrary token is rejected", async () => {
+    const repoDir = await setupRepo();
+    const { path, branch } = await run(create(repoDir));
+
+    // Forge a receipt with every external fact correct but a token no run
+    // ever issued. The registry check must reject it — external facts alone
+    // are not authority.
+    const forged = {
+      canonicalPath: path,
+      canonicalRepoDir: repoDir,
+      branch,
+      token: "deadbeefdeadbeefdeadbeefdeadbeef",
+    };
+    await expect(run(verifyOwnership(forged))).rejects.toThrow(
+      /token was not issued by any run in this process/,
+    );
+    await expect(run(removeVerified(forged))).rejects.toThrow(
+      /token was not issued by any run in this process/,
+    );
+
+    // The worktree survives the forged cleanup attempt.
+    expect(existsSync(path)).toBe(true);
+    expect(await worktreeListContains(repoDir, path)).toBe(true);
+
+    await run(remove(path));
+  });
+
+  it("a receipt whose facts were tampered with after issuance is rejected", async () => {
+    const repoDir = await setupRepo();
+    const { path, branch } = await run(create(repoDir));
+    const receipt = await run(
+      issueReceipt({ worktreePath: path, repoDir, branch }),
+    );
+
+    // Tamper: keep the real token but change the path to a foreign worktree.
+    const foreign = await run(create(repoDir));
+    const tampered = { ...receipt, canonicalPath: foreign.path };
+    await expect(run(verifyOwnership(tampered))).rejects.toThrow(
+      /tampered with/,
+    );
+
+    expect(existsSync(foreign.path)).toBe(true);
+
+    await run(remove(path));
+    await run(remove(foreign.path));
+  });
+
   it("a receipt from a different run cannot authorize cleanup of a foreign worktree", async () => {
     const repoDir = await setupRepo();
     const owned = await run(create(repoDir));
@@ -156,12 +263,10 @@ describe("WorktreeOwnership receipts", () => {
     );
 
     // Forge a receipt whose path points at the foreign worktree but whose
-    // branch is the owned worktree's branch — verification must catch the
-    // mismatch and refuse.
+    // branch is the owned worktree's branch — the registry check catches the
+    // tampered facts and refuses.
     const forged = { ...ownedReceipt, canonicalPath: foreign.path };
-    await expect(run(verifyOwnership(forged))).rejects.toThrow(
-      /branch moved|no longer registered/,
-    );
+    await expect(run(verifyOwnership(forged))).rejects.toThrow(/tampered with/);
 
     // The foreign worktree survives.
     expect(existsSync(foreign.path)).toBe(true);
@@ -188,10 +293,11 @@ describe("Lifecycle safety: remote-write-free and worktree containment", () => {
         `@echo off\r\nif "%~1"=="push" echo push >> "${logPath}"\r\ngit.exe %*\r\n`,
       );
     } else {
+      const realGit = await execAsync("which git").then((r) => r.stdout.trim());
       const shim = join(shimDir, "git");
       await writeFile(
         shim,
-        `#!/bin/sh\nif [ "$1" = "push" ]; then echo push >> "${logPath}"; fi\nexec git.real "$@"\n`,
+        `#!/bin/sh\nif [ "$1" = "push" ]; then echo push >> "${logPath}"; fi\nexec "${realGit}" "$@"\n`,
       );
       await execAsync(`chmod +x "${shim}"`);
     }
