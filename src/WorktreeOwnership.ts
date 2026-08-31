@@ -29,19 +29,62 @@ export interface WorktreeOwnershipReceipt {
   readonly token: string;
 }
 
-/** Issue a receipt for a worktree this run just created. */
+/**
+ * Host-owned registry of receipts issued by runs in this process.
+ *
+ * This is what makes the token authority rather than decoration: a receipt
+ * only authorizes destructive cleanup if its token was issued by
+ * `issueReceipt` in this process AND every fact on the receipt matches the
+ * registered copy. A fabricated receipt — correct path/repo/branch, arbitrary
+ * token — is rejected because no run ever issued that token. The registry
+ * lives in host memory, is not derivable from external git/filesystem state,
+ * and dies with the process.
+ */
+const receiptRegistry = new Map<string, WorktreeOwnershipReceipt>();
+
+/** Issue a receipt for a worktree this run just created and register it. */
 export const issueReceipt = (input: {
   readonly worktreePath: string;
   readonly repoDir: string;
   readonly branch: string;
 }): Effect.Effect<WorktreeOwnershipReceipt, WorktreeError> =>
   Effect.gen(function* () {
-    return {
+    const receipt: WorktreeOwnershipReceipt = {
       canonicalPath: yield* canonicalize(input.worktreePath),
       canonicalRepoDir: yield* canonicalize(input.repoDir),
       branch: input.branch,
       token: randomBytes(16).toString("hex"),
     };
+    receiptRegistry.set(receipt.token, receipt);
+    return receipt;
+  });
+
+/**
+ * Validate a receipt's token against the run-owned registry and confirm every
+ * fact matches the registered copy. Fails closed for fabricated, stale, or
+ * tampered receipts.
+ */
+const validateAgainstRegistry = (
+  receipt: WorktreeOwnershipReceipt,
+): Effect.Effect<void, WorktreeError> =>
+  Effect.gen(function* () {
+    const registered = receiptRegistry.get(receipt.token);
+    if (registered === undefined) {
+      return yield* failClosed(
+        receipt,
+        `receipt token was not issued by any run in this process — the receipt is fabricated or from a dead process`,
+      );
+    }
+    if (
+      registered.canonicalPath !== receipt.canonicalPath ||
+      registered.canonicalRepoDir !== receipt.canonicalRepoDir ||
+      registered.branch !== receipt.branch
+    ) {
+      return yield* failClosed(
+        receipt,
+        `receipt facts do not match the registered issuance record — the receipt has been tampered with`,
+      );
+    }
   });
 
 const canonicalize = (p: string): Effect.Effect<string, WorktreeError> =>
@@ -65,6 +108,12 @@ export const verifyOwnership = (
   receipt: WorktreeOwnershipReceipt,
 ): Effect.Effect<void, WorktreeError> =>
   Effect.gen(function* () {
+    // Fresh read #0: the token must have been issued by a run in this
+    // process and every fact must match the registered copy. This is the
+    // unforgeable ownership boundary — external state alone cannot
+    // authorize cleanup.
+    yield* validateAgainstRegistry(receipt);
+
     // Fresh read #1: the worktree must still be registered in git at the
     // exact canonical path recorded at creation time.
     const registered = yield* findRegisteredWorktree(
@@ -188,16 +237,46 @@ export const removeVerified = (
     }
 
     yield* WorktreeManager.remove(receipt.canonicalPath);
-    // Read-after-write: the worktree must no longer be registered.
-    const stillRegistered = yield* findRegisteredWorktree(
-      receipt.canonicalRepoDir,
-      receipt.canonicalPath,
-    ).pipe(Effect.catchAll(() => Effect.succeed(undefined)));
-    if (stillRegistered !== undefined) {
+    // Read-after-write: the worktree must no longer be registered. If git
+    // cannot tell us (list fails), state is UNKNOWN — fail closed rather
+    // than interpreting the failure as absence.
+    const postState = yield* Effect.either(
+      findRegisteredWorktree(receipt.canonicalRepoDir, receipt.canonicalPath),
+    );
+    if (postState._tag === "Left") {
+      return yield* Effect.fail(
+        new WorktreeError({
+          message:
+            `Cleanup postcondition UNKNOWN: failed to re-read worktree registry after removing ${receipt.canonicalPath} ` +
+            `(${postState.left.message}). External state is uncertain — inspect manually before retrying.`,
+        }),
+      );
+    }
+    if (postState.right !== undefined) {
       return yield* Effect.fail(
         new WorktreeError({
           message:
             `Cleanup postcondition failed: worktree at ${receipt.canonicalPath} is still registered in git after removal. ` +
+            `External state is uncertain — inspect manually before retrying.`,
+        }),
+      );
+    }
+    // Also confirm the directory is actually gone — `git worktree remove`
+    // exiting 0 is not proof on its own.
+    const dirGone = yield* Effect.promise(async () => {
+      try {
+        const { stat } = await import("node:fs/promises");
+        await stat(receipt.canonicalPath);
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    if (!dirGone) {
+      return yield* Effect.fail(
+        new WorktreeError({
+          message:
+            `Cleanup postcondition failed: directory at ${receipt.canonicalPath} still exists after removal. ` +
             `External state is uncertain — inspect manually before retrying.`,
         }),
       );

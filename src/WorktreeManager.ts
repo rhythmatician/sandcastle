@@ -512,21 +512,59 @@ export const pruneStale = (
         .map((line) => line.slice("worktree ".length).trim()),
     );
 
-    // Remove any directory under .sandcastle/worktrees/ that is not an active worktree
+    // Remove any directory under .sandcastle/worktrees/ that is not an active
+    // worktree — but only after applying the fail-closed preservation policy:
+    //
+    // - A directory with uncommitted changes is PRESERVED, never deleted.
+    //   Git metadata being stale/corrupt/missing is exactly the "unknown
+    //   external state" case where guessing is forbidden; dirty content is
+    //   potentially unmerged agent work.
+    // - A directory whose dirty-check itself fails is treated as dirty
+    //   (unknown → preserve).
+    // - A clean orphan directory is removed, and the removal is verified by
+    //   re-reading the directory afterwards.
     for (const entry of entries) {
       const entryPath = join(realWorktreesDir, entry);
       const isDir = yield* fs.stat(entryPath).pipe(
         Effect.map((s) => s.type === "Directory"),
         Effect.catchAll(() => Effect.succeed(false)),
       );
-      if (isDir && isOrphanedWorktreePath(entryPath, activeWorktreePaths)) {
-        yield* fs.remove(entryPath, { recursive: true, force: true }).pipe(
-          Effect.mapError(
-            (e) =>
-              new WorktreeError({
-                message: `Failed to remove ${entryPath}: ${e.message}`,
-              }),
-          ),
+      if (!isDir) continue;
+      if (!isOrphanedWorktreePath(entryPath, activeWorktreePaths)) continue;
+
+      // Fresh read: does the orphan hold uncommitted work? Unknown state
+      // (git fails, not a repo, unreadable) counts as dirty — preserve.
+      const dirty = yield* hasUncommittedChanges(entryPath).pipe(
+        Effect.catchAll(() => Effect.succeed(true)),
+      );
+      if (dirty) {
+        console.warn(
+          `[sandcastle] Preserving orphaned worktree directory ${entryPath}: ` +
+            `it contains uncommitted changes (or its state could not be read). ` +
+            `Inspect manually, then remove with: git worktree remove --force ${entryPath} ` +
+            `or rm -rf ${entryPath}`,
+        );
+        continue;
+      }
+
+      yield* fs.remove(entryPath, { recursive: true, force: true }).pipe(
+        Effect.mapError(
+          (e) =>
+            new WorktreeError({
+              message: `Failed to remove ${entryPath}: ${e.message}`,
+            }),
+        ),
+      );
+      // Read-after-write: the directory must actually be gone.
+      const gone = yield* fs.stat(entryPath).pipe(
+        Effect.map(() => false),
+        Effect.catchAll(() => Effect.succeed(true)),
+      );
+      if (!gone) {
+        return yield* Effect.fail(
+          new WorktreeError({
+            message: `Prune postcondition failed: ${entryPath} still exists after removal. External state is uncertain — inspect manually.`,
+          }),
         );
       }
     }

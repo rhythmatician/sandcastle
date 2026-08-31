@@ -514,11 +514,48 @@ export const withSandboxLifecycle = <A>(
               }),
             );
           }
-          yield* Effect.promise(() =>
-            execAsync(`git branch -D "${resolvedBranch}"`, {
-              cwd: hostRepoDir,
-            }).catch(() => {}),
-          );
+          // Delete, then verify. A swallowed deletion failure must not let
+          // the lifecycle report success with unknown branch state.
+          const deleteError = yield* Effect.promise(async () => {
+            try {
+              await execAsync(`git branch -D "${resolvedBranch}"`, {
+                cwd: hostRepoDir,
+              });
+              return null;
+            } catch (e) {
+              return e instanceof Error ? e.message : String(e);
+            }
+          });
+          if (deleteError !== null) {
+            yield* Effect.fail(
+              new SyncError({
+                message:
+                  `Failed to delete temporary branch '${resolvedBranch}' after merge: ${deleteError}. ` +
+                  `The branch has been preserved — inspect manually, then run: git branch -D ${resolvedBranch}`,
+              }),
+            );
+          }
+          // Read-after-write: the branch must actually be gone.
+          const stillExists = yield* Effect.promise(async () => {
+            try {
+              await execAsync(
+                `git rev-parse --quiet --verify "refs/heads/${resolvedBranch}"`,
+                { cwd: hostRepoDir },
+              );
+              return true;
+            } catch {
+              return false;
+            }
+          });
+          if (stillExists) {
+            yield* Effect.fail(
+              new SyncError({
+                message:
+                  `Branch deletion postcondition failed: '${resolvedBranch}' still resolves after deletion. ` +
+                  `External state is uncertain — inspect manually before retrying.`,
+              }),
+            );
+          }
         }
       }
 

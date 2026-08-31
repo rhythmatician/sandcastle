@@ -152,6 +152,53 @@ describe("WorktreeOwnership receipts", () => {
     );
   });
 
+  it("a fabricated receipt with correct path/repo/branch but an arbitrary token is rejected", async () => {
+    const repoDir = await setupRepo();
+    const { path, branch } = await run(create(repoDir));
+
+    // Forge a receipt with every external fact correct but a token no run
+    // ever issued. The registry check must reject it — external facts alone
+    // are not authority.
+    const forged = {
+      canonicalPath: path,
+      canonicalRepoDir: repoDir,
+      branch,
+      token: "deadbeefdeadbeefdeadbeefdeadbeef",
+    };
+    await expect(run(verifyOwnership(forged))).rejects.toThrow(
+      /token was not issued by any run in this process/,
+    );
+    await expect(run(removeVerified(forged))).rejects.toThrow(
+      /token was not issued by any run in this process/,
+    );
+
+    // The worktree survives the forged cleanup attempt.
+    expect(existsSync(path)).toBe(true);
+    expect(await worktreeListContains(repoDir, path)).toBe(true);
+
+    await run(remove(path));
+  });
+
+  it("a receipt whose facts were tampered with after issuance is rejected", async () => {
+    const repoDir = await setupRepo();
+    const { path, branch } = await run(create(repoDir));
+    const receipt = await run(
+      issueReceipt({ worktreePath: path, repoDir, branch }),
+    );
+
+    // Tamper: keep the real token but change the path to a foreign worktree.
+    const foreign = await run(create(repoDir));
+    const tampered = { ...receipt, canonicalPath: foreign.path };
+    await expect(run(verifyOwnership(tampered))).rejects.toThrow(
+      /tampered with/,
+    );
+
+    expect(existsSync(foreign.path)).toBe(true);
+
+    await run(remove(path));
+    await run(remove(foreign.path));
+  });
+
   it("a receipt from a different run cannot authorize cleanup of a foreign worktree", async () => {
     const repoDir = await setupRepo();
     const owned = await run(create(repoDir));
@@ -166,12 +213,10 @@ describe("WorktreeOwnership receipts", () => {
     );
 
     // Forge a receipt whose path points at the foreign worktree but whose
-    // branch is the owned worktree's branch — verification must catch the
-    // mismatch and refuse.
+    // branch is the owned worktree's branch — the registry check catches the
+    // tampered facts and refuses.
     const forged = { ...ownedReceipt, canonicalPath: foreign.path };
-    await expect(run(verifyOwnership(forged))).rejects.toThrow(
-      /branch moved|no longer registered/,
-    );
+    await expect(run(verifyOwnership(forged))).rejects.toThrow(/tampered with/);
 
     // The foreign worktree survives.
     expect(existsSync(foreign.path)).toBe(true);

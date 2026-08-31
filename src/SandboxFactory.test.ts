@@ -2,7 +2,14 @@ import { Effect, Exit, Layer, Ref } from "effect";
 import { NodeFileSystem } from "@effect/platform-node";
 import { exec } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, readdir, writeFile, rm } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  readFile,
+  readdir,
+  writeFile,
+  rm,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -536,6 +543,171 @@ describe("WorktreeDockerSandboxFactory", () => {
     expect(
       (exit.cause.error as AgentIdleTimeoutError).preservedWorktreePath,
     ).toBeUndefined();
+  });
+
+  describe("lifecycle safety (issue #6): production withSandbox paths", () => {
+    /** Snapshot the caller worktree's HEAD + tracked + untracked state. */
+    const snapshotCallerState = async (dir: string) => {
+      const { stdout: head } = await execAsync("git rev-parse HEAD", {
+        cwd: dir,
+      });
+      const { stdout: status } = await execAsync("git status --porcelain", {
+        cwd: dir,
+      });
+      return { head: head.trim(), status: status.trim() };
+    };
+
+    it("success path: clean worktree is removed exactly once and freshly verified", async () => {
+      let observedWorktreePath: string | undefined;
+      const result = await Effect.runPromise(
+        Effect.gen(function* () {
+          const factory = yield* SandboxFactory;
+          return yield* factory.withSandbox((info) =>
+            Effect.gen(function* () {
+              observedWorktreePath = info.hostWorktreePath;
+              return "ok";
+            }),
+          );
+        }).pipe(Effect.provide(makeLayer())),
+      );
+
+      expect(result.value).toBe("ok");
+      expect(result.preservedWorktreePath).toBeUndefined();
+      expect(existsSync(observedWorktreePath!)).toBe(false);
+      // Postcondition: no worktree registered, nothing left under worktrees/.
+      const worktree = await findCreatedWorktree(hostRepoDir);
+      expect(worktree).toBeUndefined();
+    });
+
+    it("worker failure path: primary failure survives and clean worktree is removed", async () => {
+      let observedWorktreePath: string | undefined;
+      const exit = await Effect.runPromiseExit(
+        Effect.gen(function* () {
+          const factory = yield* SandboxFactory;
+          yield* factory.withSandbox((info) => {
+            observedWorktreePath = info.hostWorktreePath;
+            return Effect.fail(new AgentError({ message: "worker boom" }));
+          });
+        }).pipe(Effect.provide(makeLayer())),
+      );
+
+      expect(Exit.isFailure(exit)).toBe(true);
+      if (!Exit.isFailure(exit) || exit.cause._tag !== "Fail") {
+        throw new Error("expected Fail exit");
+      }
+      // Primary failure is what propagates — not a cleanup error.
+      expect((exit.cause.error as AgentError).message).toBe("worker boom");
+      expect(existsSync(observedWorktreePath!)).toBe(false);
+    });
+
+    it("dirty preservation path: interrupted work survives a worker failure", async () => {
+      let observedWorktreePath: string | undefined;
+      const exit = await Effect.runPromiseExit(
+        Effect.gen(function* () {
+          const factory = yield* SandboxFactory;
+          yield* factory.withSandbox((info) =>
+            Effect.gen(function* () {
+              observedWorktreePath = info.hostWorktreePath;
+              yield* Effect.promise(() =>
+                writeFile(
+                  join(info.hostWorktreePath!, "wip.txt"),
+                  "interrupted work",
+                ),
+              );
+              return yield* Effect.fail(
+                new AgentError({ message: "worker boom" }),
+              );
+            }),
+          );
+        }).pipe(Effect.provide(makeLayer())),
+      );
+
+      expect(Exit.isFailure(exit)).toBe(true);
+      // Worktree preserved with its content intact.
+      expect(existsSync(observedWorktreePath!)).toBe(true);
+      const content = await readFile(
+        join(observedWorktreePath!, "wip.txt"),
+        "utf-8",
+      );
+      expect(content).toBe("interrupted work");
+    });
+
+    it("caller worktree is byte-identical across success and failure", async () => {
+      await commitFile(hostRepoDir, "tracked.txt", "original", "add tracked");
+      await writeFile(join(hostRepoDir, "untracked.txt"), "caller file");
+      const before = await snapshotCallerState(hostRepoDir);
+
+      // Success.
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const factory = yield* SandboxFactory;
+          yield* factory.withSandbox(() => Effect.void);
+        }).pipe(Effect.provide(makeLayer())),
+      );
+
+      // Failure.
+      await Effect.runPromiseExit(
+        Effect.gen(function* () {
+          const factory = yield* SandboxFactory;
+          yield* factory.withSandbox(() =>
+            Effect.fail(new AgentError({ message: "boom" })),
+          );
+        }).pipe(Effect.provide(makeLayer())),
+      );
+
+      const after = await snapshotCallerState(hostRepoDir);
+      expect(after.head).toBe(before.head);
+      expect(after.status).toBe(before.status);
+      const tracked = await readFile(join(hostRepoDir, "tracked.txt"), "utf-8");
+      expect(tracked).toBe("original");
+    });
+
+    it("zero remote writes across the production lifecycle (success + failure + dirty)", async () => {
+      if (process.platform === "win32") return; // POSIX shim test
+      const shimDir = await mkdtemp(join(tmpdir(), "sf-push-shim-"));
+      const logPath = join(shimDir, "push.log");
+      const realGit = (
+        await execAsync("which git").then((r) => r.stdout.trim())
+      ).trim();
+      const shim = join(shimDir, "git");
+      await writeFile(
+        shim,
+        `#!/bin/sh\nif [ "$1" = "push" ]; then echo push >> "${logPath}"; fi\nexec "${realGit}" "$@"\n`,
+      );
+      await execAsync(`chmod +x "${shim}"`);
+
+      const originalPath = process.env.PATH;
+      process.env.PATH = `${shimDir}:${originalPath ?? ""}`;
+      try {
+        // Success.
+        await Effect.runPromise(
+          Effect.gen(function* () {
+            const factory = yield* SandboxFactory;
+            yield* factory.withSandbox(() => Effect.void);
+          }).pipe(Effect.provide(makeLayer())),
+        );
+        // Failure with dirty worktree (preserve path).
+        await Effect.runPromiseExit(
+          Effect.gen(function* () {
+            const factory = yield* SandboxFactory;
+            yield* factory.withSandbox((info) =>
+              Effect.gen(function* () {
+                yield* Effect.promise(() =>
+                  writeFile(join(info.hostWorktreePath!, "wip.txt"), "wip"),
+                );
+                return yield* Effect.fail(new AgentError({ message: "boom" }));
+              }),
+            );
+          }).pipe(Effect.provide(makeLayer())),
+        );
+
+        const pushLog = await readFile(logPath, "utf-8").catch(() => "");
+        expect(pushLog).toBe("");
+      } finally {
+        if (originalPath === undefined) delete process.env.PATH;
+        else process.env.PATH = originalPath;
+      }
+    });
   });
 
   describe("head branch strategy", () => {

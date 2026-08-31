@@ -807,6 +807,67 @@ describe("WorktreeManager.pruneStale", () => {
 
     await run(remove(path));
   });
+
+  it("preserves an orphaned directory that contains uncommitted work (fail-closed)", async () => {
+    const repoDir = await setupRepo();
+    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+    await mkdir(worktreesDir, { recursive: true });
+
+    // An orphaned directory holding what looks like unmerged agent work.
+    const orphanDir = join(worktreesDir, "orphan-with-work");
+    await mkdir(orphanDir);
+    await writeFile(join(orphanDir, "wip.txt"), "unmerged work");
+
+    await run(pruneStale(repoDir));
+
+    // Preserved, not deleted.
+    const s = await stat(orphanDir);
+    expect(s.isDirectory()).toBe(true);
+    const content = await readFile(join(orphanDir, "wip.txt"), "utf-8");
+    expect(content).toBe("unmerged work");
+  });
+
+  it("preserves an orphaned directory whose state cannot be read (unknown → preserve)", async () => {
+    const repoDir = await setupRepo();
+    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+    await mkdir(worktreesDir, { recursive: true });
+
+    // An orphaned directory that is not a git repo at all — the dirty check
+    // cannot succeed, so the state is unknown and must be preserved.
+    const orphanDir = join(worktreesDir, "orphan-not-a-repo");
+    await mkdir(orphanDir);
+    await writeFile(join(orphanDir, "mystery.txt"), "unknown provenance");
+
+    await run(pruneStale(repoDir));
+
+    const s = await stat(orphanDir);
+    expect(s.isDirectory()).toBe(true);
+    const content = await readFile(join(orphanDir, "mystery.txt"), "utf-8");
+    expect(content).toBe("unknown provenance");
+  });
+
+  it("still removes a clean orphaned directory and verifies the removal", async () => {
+    const repoDir = await setupRepo();
+    const worktreesDir = join(repoDir, ".sandcastle", "worktrees");
+    await mkdir(worktreesDir, { recursive: true });
+
+    // A clean orphan: init a repo and commit so the dirty check passes.
+    const orphanDir = join(worktreesDir, "orphan-clean");
+    await mkdir(orphanDir);
+    await execAsync("git init -b main", { cwd: orphanDir });
+    await execAsync('git config user.email "test@test.com"', {
+      cwd: orphanDir,
+    });
+    await execAsync('git config user.name "Test"', { cwd: orphanDir });
+    await writeFile(join(orphanDir, "f.txt"), "x");
+    await execAsync("git add f.txt", { cwd: orphanDir });
+    await execAsync('git commit -m "clean"', { cwd: orphanDir });
+
+    await run(pruneStale(repoDir));
+
+    const entries = await readdir(worktreesDir).catch(() => []);
+    expect(entries).not.toContain("orphan-clean");
+  });
 });
 
 describe("WorktreeManager.hasUncommittedChanges", () => {
