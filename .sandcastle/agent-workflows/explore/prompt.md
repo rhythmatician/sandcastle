@@ -12,7 +12,7 @@ This is a read-only first pass. You are not implementing the change. Your job is
 
 Read the project's domain and architecture docs to ground your assessment:
 
-- `CONTEXT.md`
+- `GLOSSARY.md`
 - `docs/adr/` if relevant
 - `.sandcastle/CODING_STANDARDS.md`
 
