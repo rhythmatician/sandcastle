@@ -1,5 +1,17 @@
 # @ai-hero/sandcastle
 
+## 0.13.0
+
+### Minor Changes
+
+- eeae29e: Add Muse agent provider
+
+### Patch Changes
+
+- 9c01339: Security: force esbuild >= 0.28.1 to fix Windows path traversal vulnerability (CVE in esbuild >= 0.27.3 < 0.28.1).
+- eeae29e: Make host worktree creation and pruning timeouts configurable through `timeouts.worktreeMs`, raise the default to 120 seconds, and terminate Git subprocesses when lifecycle operations time out.
+- 78cd934: Prove worktree lifecycle safety: destructive cleanup now requires a run-scoped ownership receipt verified against freshly re-read git state (registration, branch, directory, uncommitted-work check) before and after removal. Unknown, stale, or contradictory state fails closed — nothing is mutated and the worktree is preserved for inspection. Cleanup failures no longer mask the primary run failure, and a successful run can no longer be reported while cleanup postconditions are unverified. A read-before-write guard also prevents force-deleting a temp branch whose tip is not an ancestor of the host branch.
+
 ## 0.12.0
 
 ### Minor Changes
